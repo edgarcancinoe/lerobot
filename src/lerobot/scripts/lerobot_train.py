@@ -52,7 +52,22 @@ from lerobot.utils.utils import (
     has_method,
     init_logging,
 )
-
+def debug_batch(batch, tag="", step=0, only_step=0):
+    """Call this at any point in the pipeline to inspect tensors."""
+    if step != only_step:
+        return
+    print(f"\n{'='*60}")
+    print(f"[DEBUG] {tag} | step={step}")
+    print(f"{'='*60}")
+    for k, v in sorted(batch.items()):
+        if isinstance(v, torch.Tensor):
+            extra = ""
+            if v.dtype in (torch.float16, torch.float32, torch.float64):
+                extra = f" | min={v.min().item():.4f} max={v.max().item():.4f} mean={v.mean().item():.4f}"
+            print(f"  {k}: shape={list(v.shape)} dtype={v.dtype}{extra}")
+        else:
+            print(f"  {k}: {type(v).__name__} = {v}")
+    print()
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -449,16 +464,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
-        
-        # Debugging for first batch
-        if step == 0 and is_main_process:
-            logging.info(colored("First batch debugging (Before Preprocessing):", "yellow"))
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    stats = f" | min={v.min().item():.3f}, max={v.max().item():.3f}" if "image" in k or "observation" in k else ""
-                    logging.info(f"  > {k}: {v.shape} ({v.dtype}){stats}")
-        
+        debug_batch(batch, tag="RAW (before preprocess)", step=step)
         batch = preprocessor(batch)
+        debug_batch(batch, tag="POST (after preprocess)", step=step)
         
         # Debugging for post-preprocessed batch
         if step == 0 and is_main_process:
@@ -492,6 +500,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             lr_scheduler=lr_scheduler,
             rabc_weights_provider=rabc_weights,
         )
+        debug_batch(output_dict, tag="MODEL OUTPUT dict", step=step)
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -549,12 +558,43 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 cfg.policy.repo_id = f"{original_repo_id}-step-{step}"
 
                 unwrapped_policy = accelerator.unwrap_model(policy)
-                if cfg.policy.use_peft:
-                    unwrapped_policy.push_model_to_hub(cfg, peft_model=unwrapped_policy)
-                else:
-                    unwrapped_policy.push_model_to_hub(cfg)
-                preprocessor.push_to_hub(cfg.policy.repo_id)
-                postprocessor.push_to_hub(cfg.policy.repo_id)
+                
+                # Push the files to the repo in a single commit by saving to a local tmp dir
+                from tempfile import TemporaryDirectory
+                from pathlib import Path
+                from huggingface_hub import HfApi
+
+                api = HfApi()
+                api.create_repo(repo_id=cfg.policy.repo_id, private=cfg.policy.private, exist_ok=True)
+                
+                with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                    saved_path = Path(tmp) / cfg.policy.repo_id.split("/")[-1]
+                    
+                    if cfg.policy.use_peft:
+                        unwrapped_policy.save_pretrained(saved_path)
+                        unwrapped_policy.config.save_pretrained(saved_path)
+                    else:
+                        unwrapped_policy.save_pretrained(saved_path)
+
+                    cfg.save_pretrained(saved_path)
+                    if preprocessor:
+                        preprocessor.save_pretrained(saved_path)
+                    if postprocessor:
+                        postprocessor.save_pretrained(saved_path)
+                        
+                    card = unwrapped_policy.generate_model_card(
+                        cfg.dataset.repo_id, unwrapped_policy.config.type, unwrapped_policy.config.license, unwrapped_policy.config.tags
+                    )
+                    card.save(str(saved_path / "README.md"))
+
+                    api.upload_folder(
+                        repo_id=cfg.policy.repo_id,
+                        repo_type="model",
+                        folder_path=str(saved_path),
+                        commit_message=f"Upload checkpoint for step {step}",
+                        allow_patterns=["*.safetensors", "*.json", "*.yaml", "*.md"],
+                        ignore_patterns=["*.tmp", "*.log"],
+                    )
 
                 # Restore original repo_id for the next steps
                 cfg.policy.repo_id = original_repo_id
