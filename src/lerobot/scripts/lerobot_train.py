@@ -15,6 +15,20 @@
 # limitations under the License.
 import dataclasses
 import logging
+import warnings
+import os
+
+# Suppress Hugging Face transformers warnings related to Florence2 and GenerationMixin
+os.environ["ACCELERATE_LOG_LEVEL"] = "error"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+warnings.filterwarnings("ignore", module=".*transformers.*")
+warnings.filterwarnings("ignore", module=".*accelerate.*")
+warnings.filterwarnings("ignore", message=".*Florence2ForConditionalGeneration has generative capabilities.*")
+warnings.filterwarnings("ignore", message=".*Detected kernel version.*")
+
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("accelerate").setLevel(logging.ERROR)
+
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -52,22 +66,129 @@ from lerobot.utils.utils import (
     has_method,
     init_logging,
 )
-def debug_batch(batch, tag="", step=0, only_step=0):
+def debug_batch(batch, tag="", step=0, only_step=0, slice_dim=None):
     """Call this at any point in the pipeline to inspect tensors."""
     if step != only_step:
         return
-    print(f"\n{'='*60}")
-    print(f"[DEBUG] {tag} | step={step}")
-    print(f"{'='*60}")
-    for k, v in sorted(batch.items()):
-        if isinstance(v, torch.Tensor):
-            extra = ""
-            if v.dtype in (torch.float16, torch.float32, torch.float64):
-                extra = f" | min={v.min().item():.4f} max={v.max().item():.4f} mean={v.mean().item():.4f}"
-            print(f"  {k}: shape={list(v.shape)} dtype={v.dtype}{extra}")
-        else:
-            print(f"  {k}: {type(v).__name__} = {v}")
-    print()
+    
+    logging.info(colored(f"\n{'='*60}", "magenta", attrs=["bold"]))
+    logging.info(colored(f"[DEBUG] {tag} | step={step}", "magenta", attrs=["bold"]))
+    logging.info(colored(f"{'='*60}", "magenta", attrs=["bold"]))
+    
+    if not batch:
+        logging.info(colored("  (Empty dictionary)", "red"))
+    else:
+        for k, v in sorted(batch.items()):
+            padded_key = f"  {k}:".ljust(40)
+            key_str = colored(padded_key, "cyan")
+            
+            if isinstance(v, torch.Tensor):
+                extra = ""
+                if v.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                    # Handle empty tensors safely
+                    if v.numel() > 0:
+                        extra = f" | min={v.min().item():.4f} max={v.max().item():.4f} mean={v.mean().item():.4f}"
+                        if k == "pred_action" and slice_dim is not None:
+                            try:
+                                mean_1 = v[..., :slice_dim].to(torch.float32).mean().item()
+                                mean_2 = v[..., slice_dim:].to(torch.float32).mean().item()
+                                extra += f" | mean(0:{slice_dim})={mean_1:.4f} mean({slice_dim}:end)={mean_2:.4f}"
+                            except Exception:
+                                pass
+                    else:
+                        extra = " | (empty tensor)"
+                
+                shape_str = f"shape={list(v.shape)} dtype={v.dtype}{extra}"
+                logging.info(f"{key_str} {shape_str}")
+            else:
+                val_str = str(v)
+                if len(val_str) > 60:
+                    val_str = val_str[:57] + "..."
+                logging.info(f"{key_str} type={type(v).__name__} value={val_str}")
+
+    logging.info("")
+
+def log_processor_stats(step, dataset_meta=None):
+    """Log the normalizer processor stats (min, max, mean, std, count)."""
+    if hasattr(step, "stats") and step.stats:
+        logging.info(colored(f"\n{'='*70}", "cyan", attrs=["bold"]))
+        logging.info(colored(f"  Normalization Stats [{type(step).__name__}]", "cyan", attrs=["bold"]))
+        logging.info(colored(f"{'='*70}", "cyan", attrs=["bold"]))
+        for feat_key, feat_stats in step.stats.items():
+            if feat_key not in ["action", "observation.state"]:
+                continue
+            logging.info(colored(f"\n  Feature: {feat_key}", "green", attrs=["bold"]))
+            
+            wanted_stats = ["min", "max", "mean", "std"]
+            available_stats = [k for k in wanted_stats if k in feat_stats]
+            
+            # Extract count separately
+            count_val = feat_stats.get("count", "N/A")
+            if hasattr(count_val, "tolist"): count_val = count_val.tolist()
+            if isinstance(count_val, (list, tuple)) and len(count_val) >= 1: count_val = count_val[0]
+            logging.info(colored(f"  Count:   {count_val}", "green"))
+            
+            if not available_stats:
+                continue
+                
+            # Attempt to find feature names from dataset_meta
+            feat_names = None
+            if dataset_meta and feat_key in dataset_meta.features:
+                feature_info = dataset_meta.features[feat_key]
+                if isinstance(feature_info, dict):
+                    feat_names = feature_info.get("names")
+                elif hasattr(feature_info, "names"):
+                    feat_names = feature_info.names
+
+            first_stat = feat_stats[available_stats[0]]
+            if hasattr(first_stat, "tolist"): first_stat = first_stat.tolist()
+            if not isinstance(first_stat, (list, tuple)): first_stat = [first_stat]
+            num_dims = len(first_stat)
+
+            name_width = 15
+            header_str = f"  {'Dim Name':<{name_width}}" + "".join([f" | {s:<8}" for s in available_stats])
+            logging.info(colored(f"  {'-' * (len(header_str) - 2)}", "green"))
+            logging.info(colored(header_str, "green", attrs=["bold"]))
+            logging.info(colored(f"  {'-' * (len(header_str) - 2)}", "green"))
+            
+            for i in range(num_dims):
+                dim_name = f"Dim {i}"
+                if feat_names is not None and i < len(feat_names):
+                    d_name = feat_names[i]
+                    if isinstance(d_name, dict) and 'name' in d_name:
+                        dim_name = d_name['name']
+                    elif isinstance(d_name, str):
+                        dim_name = d_name
+                elif num_dims == 10 and feat_key in ["action", "observation.state"]:
+                    default_names = ["x", "y", "z", "roll", "pitch", "yaw", "gripper", "pad_1", "pad_2", "pad_3"]
+                    dim_name = default_names[i]
+                elif num_dims == 16 and feat_key in ["action", "observation.state"]:
+                    default_names = ["x", "y", "z", "roll", "pitch", "yaw", "gripper", "mobile_v", "mobile_w", "pad_1", "pad_2", "pad_3", "pad_4", "pad_5", "pad_6", "pad_7"]
+                    if i < len(default_names): dim_name = default_names[i]
+                
+                if len(dim_name) > name_width:
+                    dim_name = dim_name[:name_width-2] + ".."
+                
+                row_str = f"  {dim_name:<{name_width}}"
+                for stat_k in available_stats:
+                    val = feat_stats[stat_k]
+                    if hasattr(val, "tolist"): val = val.tolist()
+                    if isinstance(val, (list, tuple)):
+                        v = val[i] if i < len(val) else None
+                    else:
+                        v = val if i == 0 else None
+                    
+                    if v is not None:
+                        if isinstance(v, float):
+                            row_str += f" | {v:>8.4f}"
+                        else:
+                            row_str += f" | {str(v)[:8]:>8}"
+                    else:
+                        row_str += f" | {'-':>8}"
+                logging.info(colored(row_str, "green"))
+                
+            logging.info(colored(f"  {'-' * (len(header_str) - 2)}", "green"))
+        logging.info(colored(f"{'='*70}", "cyan", attrs=["bold"]))
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -199,21 +320,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when policy.device is set to CPU.
         force_cpu = cfg.policy.device == "cpu"
-        accelerator = Accelerator(
-            step_scheduler_with_optimizer=False,
-            kwargs_handlers=[ddp_kwargs],
-            cpu=force_cpu,
-        )
+        accelerator = Accelerator( step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs], cpu=force_cpu,)
 
     init_logging(accelerator=accelerator)
 
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
     is_main_process = accelerator.is_main_process
-
-    # Only log on main process
-    if is_main_process:
-        logging.info(pformat(cfg.to_dict()))
 
     # Initialize wandb only on main process
     if cfg.wandb.enable and cfg.wandb.project and is_main_process:
@@ -242,6 +355,48 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    ##############################################################################################################
+    ##############################################################################################################
+    # === CUSTOM DATA SLICING FOR ACTION AND STATE STRATEGIES ===
+    ##############################################################################################################
+    ##############################################################################################################
+
+    action_mode = getattr(cfg.policy, "action_mode", "").lower()
+    ACTION_DIM_SLICE_START = 0
+    ACTION_DIM_SLICE_END = None
+    if "ee6d" in action_mode:
+        ACTION_DIM_SLICE_END = 10  # EE6D slice
+    elif "joint" in action_mode:
+        ACTION_DIM_SLICE_START = 10
+        ACTION_DIM_SLICE_END = 16  # Joint slice
+    
+    if hasattr(dataset, "meta") and (ACTION_DIM_SLICE_START != 0 or ACTION_DIM_SLICE_END is not None):
+        for key in ["action", "observation.state"]:
+            if key in dataset.meta.features and "shape" in dataset.meta.features[key]:
+                feat_shape = dataset.meta.features[key]["shape"]
+                if isinstance(feat_shape, (list, tuple)) and len(feat_shape) > 0:
+                    old_shape = list(feat_shape)
+                    end = old_shape[-1] if ACTION_DIM_SLICE_END is None else min(old_shape[-1], ACTION_DIM_SLICE_END)
+                    old_shape[-1] = max(0, end - ACTION_DIM_SLICE_START)
+                    dataset.meta.features[key]["shape"] = tuple(old_shape)
+                elif isinstance(feat_shape, dict) and "shape" in feat_shape:
+                    old_shape = list(feat_shape["shape"])
+                    end = old_shape[-1] if ACTION_DIM_SLICE_END is None else min(old_shape[-1], ACTION_DIM_SLICE_END)
+                    old_shape[-1] = max(0, end - ACTION_DIM_SLICE_START)
+                    dataset.meta.features[key]["shape"] = tuple(old_shape)
+                
+            if key in dataset.meta.stats:
+                for stat_key in ["min", "max", "mean", "std"]:
+                    if stat_key in dataset.meta.stats[key]:
+                        end = len(dataset.meta.stats[key][stat_key]) if ACTION_DIM_SLICE_END is None else ACTION_DIM_SLICE_END
+                        dataset.meta.stats[key][stat_key] = dataset.meta.stats[key][stat_key][ACTION_DIM_SLICE_START:end]
+
+    if is_main_process and (ACTION_DIM_SLICE_START != 0 or ACTION_DIM_SLICE_END is not None):
+        logging.info(colored(f"\n--- DATA SLICING APPLIED ---", "yellow", attrs=["bold"]))
+        logging.info(colored(f"  > Detected Action Mode: {action_mode}", "cyan"))
+        end_str = str(ACTION_DIM_SLICE_END) if ACTION_DIM_SLICE_END is not None else "end"
+        logging.info(colored(f"  > Sliced 'action' & 'observation.state' dim bounds: [{ACTION_DIM_SLICE_START}:{end_str}]", "cyan"))
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -252,11 +407,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating policy")
-    policy = make_policy(
-        cfg=cfg.policy,
-        ds_meta=dataset.meta,
-        rename_map=cfg.rename_map,
-    )
+    
+    policy = make_policy( cfg=cfg.policy, ds_meta=dataset.meta, rename_map=cfg.rename_map)
+
+    # Safety: explicitly stamp the CLI-provided normalization_mapping onto the policy config.
+    # policy.config IS cfg.policy (same object), but this guard makes the intent explicit and
+    # protects against future refactors that might deep-copy the config inside make_policy.
+    policy.config.normalization_mapping = cfg.policy.normalization_mapping
+
+    if is_main_process:
+        logging.info(colored("\n--- POLICY CONFIGURATION ---", "yellow", attrs=["bold"]))
+        logging.info(f"  > Input Features:  {', '.join(policy.config.input_features.keys())}")
+        logging.info(f"  > Output Features: {', '.join(policy.config.output_features.keys())}")
+        logging.info(colored("  > Norm Mapping (embedded in every saved config.json):", "green"))
+        for k, v in policy.config.normalization_mapping.items():
+            logging.info(colored(f"      {k}: {v}", "green"))
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")
@@ -266,10 +431,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
-
-    if is_main_process:
-        logging.info("Policy Config:")
-        logging.info(pformat(dataclasses.asdict(policy.config)))
 
     # Move custom augmenter from dataset to policy and to device for GPU-side augmentation
     if hasattr(dataset, "image_augmenter") and dataset.image_augmenter is not None:
@@ -306,6 +467,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         processor_kwargs["dataset_meta"] = dataset.meta
 
     if cfg.policy.pretrained_path is not None:
+        # Preprocessor
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
@@ -314,9 +476,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "norm_map": policy.config.normalization_mapping,
             },
         }
+        # Custom remap for matching camera names.
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
             "rename_map": cfg.rename_map
         }
+        # Postprocesor
         postprocessor_kwargs["postprocessor_overrides"] = {
             "unnormalizer_processor": {
                 "stats": dataset.meta.stats,
@@ -324,25 +488,59 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "norm_map": policy.config.normalization_mapping,
             },
         }
-    print(cfg.policy)
+
+    if is_main_process:
+        logging.info(colored("\n--- DATASET PIPELINE CONFIGURATION ---", "yellow", attrs=["bold"]))
+        logging.info(f"  > Dataset Stat Keys: {', '.join(dataset.meta.stats.keys())}")
+        logging.info(f"  > Input Features:    {', '.join(policy.config.input_features.keys())}")
+        logging.info(f"  > Norm Map:")
+        for k, v in policy.config.normalization_mapping.items():
+            logging.info(f"      {k}: {v}")
+
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+                
+    if getattr(cfg.policy, "action_mode", "") != "" and "ACTION_DIM_SLICE_START" in locals():
+        from lerobot.processor.slice_processor import SliceProcessorStep
+        from lerobot.processor.normalize_processor import NormalizerProcessorStep
+        
+        slice_map = {}
+        if "action" in dataset.meta.features:
+            slice_map["action"] = (ACTION_DIM_SLICE_START, ACTION_DIM_SLICE_END)
+        if "observation.state" in dataset.meta.features:
+            slice_map["observation.state"] = (ACTION_DIM_SLICE_START, ACTION_DIM_SLICE_END)
+            
+        if slice_map:
+            slice_step = SliceProcessorStep(slice_map=slice_map)
+            
+            # Insert before NormalizerProcessorStep (so we slice before normalizing)
+            insert_idx = len(preprocessor.steps)
+            for idx, step_ in enumerate(preprocessor.steps):
+                if isinstance(step_, NormalizerProcessorStep):
+                    insert_idx = idx
+                    break
+            
+            # HACK: Because the pipeline saves the class path if it can't find registry name
+            preprocessor.steps.insert(insert_idx, slice_step)
 
     if is_main_process:
-        logging.info(colored("Processor Pipelines:", "cyan", attrs=["bold"]))
-        logging.info(f"  > Preprocessor steps: {[type(s).__name__ for s in preprocessor.steps]}")
-        logging.info(f"  > Postprocessor steps: {[type(s).__name__ for s in postprocessor.steps]}")
+        logging.info(colored("\n--- PRE-POST PROCESSORS INITIALIZED ---", "cyan", attrs=["bold"]))
         
-        # Explicit check for XVLAImageToFloatProcessorStep
-        has_float_step = any("XVLAImageToFloat" in type(s).__name__ for s in preprocessor.steps)
-        if has_float_step:
-            logging.info(colored("  ✓ XVLAImageToFloatProcessorStep is present in pipeline", "green"))
-        else:
-            logging.error(colored("  ✗ XVLAImageToFloatProcessorStep is MISSING from pipeline!", "red"))
+        logging.info("  > Preprocessor steps:")
+        for s in preprocessor.steps:
+            logging.info(f"      - {type(s).__name__}")
+            if type(s).__name__ == "NormalizerProcessorStep":
+                log_processor_stats(s, dataset.meta)
+                
+        logging.info("  > Postprocessor steps:")
+        for s in postprocessor.steps:
+            logging.info(f"      - {type(s).__name__}")
+            if type(s).__name__ == "UnnormalizerProcessorStep":
+                log_processor_stats(s, dataset.meta)
 
         # Log Rename Map details
         if cfg.rename_map:
@@ -416,91 +614,61 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     else:
         shuffle = True
         sampler = None
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        num_workers=cfg.num_workers,
-        batch_size=cfg.batch_size,
-        shuffle=shuffle and not cfg.dataset.streaming,
-        sampler=sampler,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
-    )
+    
+    dataloader = torch.utils.data.DataLoader( dataset, num_workers=cfg.num_workers, batch_size=cfg.batch_size, shuffle=shuffle and not cfg.dataset.streaming, sampler=sampler, pin_memory=device.type == "cuda", drop_last=False, prefetch_factor=2 if cfg.num_workers > 0 else None,)
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
+    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(policy, optimizer, dataloader, lr_scheduler)
     dl_iter = cycle(dataloader)
-
     policy.train()
-
-    train_metrics = {
-        "loss": AverageMeter("loss", ":.3f"),
-        "grad_norm": AverageMeter("grdn", ":.3f"),
-        "lr": AverageMeter("lr", ":0.1e"),
-        "update_s": AverageMeter("updt_s", ":.3f"),
-        "dataloading_s": AverageMeter("data_s", ":.3f"),
-    }
-
+    train_metrics = { "loss": AverageMeter("loss", ":.3f"), "grad_norm": AverageMeter("grdn", ":.3f"), "lr": AverageMeter("lr", ":0.1e"), "update_s": AverageMeter("updt_s", ":.3f"), "dataloading_s": AverageMeter("data_s", ":.3f"),}
     # Use effective batch size for proper epoch calculation in distributed training
     effective_batch_size = cfg.batch_size * accelerator.num_processes
-    train_tracker = MetricsTracker(
-        effective_batch_size,
-        dataset.num_frames,
-        dataset.num_episodes,
-        train_metrics,
-        initial_step=step,
-        accelerator=accelerator,
-    )
+    train_tracker = MetricsTracker( effective_batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step, accelerator=accelerator,)
 
     if is_main_process:
-        logging.info(
-            f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
-        )
+        logging.info(f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}")
 
+    ##############################################################################################################
+    ##############################################################################################################
+    ######################################xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx########################################
+    ######################################   START OF THE TRAINING LOOP   ########################################
+    ######################################xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx########################################
+    ##############################################################################################################
+    ##############################################################################################################
+
+    print("-------------------------------------------------------------------------------------------------------")
+    print("Starting Training Loop")
+    print("-------------------------------------------------------------------------------------------------------")
     for _ in range(step, cfg.steps):
+
         start_time = time.perf_counter()
         batch = next(dl_iter)
+
+        # PRE PROCESSING
         debug_batch(batch, tag="RAW (before preprocess)", step=step)
         batch = preprocessor(batch)
         debug_batch(batch, tag="POST (after preprocess)", step=step)
         
-        # Debugging for post-preprocessed batch
-        if step == 0 and is_main_process:
-            logging.info(colored("Post-preprocessed batch debugging (After Preprocessing):", "yellow"))
-            # Identify what happened to the image keys
-            for dst in ["observation.images.image", "observation.images.image2"]:
-                if dst in batch:
-                    # Find original source if possible
-                    src = "Unknown"
-                    if cfg.rename_map:
-                        for s, d in cfg.rename_map.items():
-                            if d == dst:
-                                src = s
-                                break
-                    logging.info(colored(f"  [PIPELINE OUTPUT] {dst} (derived from {src})", "green"))
-
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    stats = f" | min={v.min().item():.3f}, max={v.max().item():.3f}" if "image" in k or "observation" in k else ""
-                    logging.info(f"  > {k}: {v.shape} ({v.dtype}){stats}")
-        
+        # Use data
         train_tracker.dataloading_s = time.perf_counter() - start_time
+        train_tracker, output_dict = update_policy(train_tracker, policy, batch, optimizer, cfg.optimizer.grad_clip_norm, accelerator=accelerator, lr_scheduler=lr_scheduler, rabc_weights_provider=rabc_weights)
+        
+        slice_dim = None
+        if "ACTION_DIM_SLICE_START" in locals():
+            if ACTION_DIM_SLICE_END is not None:
+                slice_dim = ACTION_DIM_SLICE_END - ACTION_DIM_SLICE_START
+            elif "action" in dataset.meta.features:
+                slice_dim = dataset.meta.features["action"].shape[-1] - ACTION_DIM_SLICE_START
 
-        train_tracker, output_dict = update_policy(
-            train_tracker,
-            policy,
-            batch,
-            optimizer,
-            cfg.optimizer.grad_clip_norm,
-            accelerator=accelerator,
-            lr_scheduler=lr_scheduler,
-            rabc_weights_provider=rabc_weights,
-        )
-        debug_batch(output_dict, tag="MODEL OUTPUT dict", step=step)
+        debug_batch(output_dict, tag="MODEL OUTPUT dict", step=step, slice_dim=slice_dim)
+
+        ##############################################################################################################
+        ##############################################################################################################
+        # LOGS AND STUFF
+        ##############################################################################################################
+        ##############################################################################################################
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -529,6 +697,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
+        ##############################################################################################################
+        ##############################################################################################################
+        # SAVING CHECKPOINTS
+        ##############################################################################################################
+        ##############################################################################################################
+
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
@@ -549,10 +723,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
             accelerator.wait_for_everyone()
 
+        ##############################################################################################################
+        ##############################################################################################################
+        # PUSH STEP FOR CUSTOM PUSH EVERY
+        ##############################################################################################################
+        ##############################################################################################################
+
         is_push_step = cfg.push_every > 0 and step % cfg.push_every == 0 and step != cfg.steps
         if is_push_step:
             if is_main_process:
                 logging.info(f"Pushing checkpoint to Hub after step {step}")
+                norm_map_str = ", ".join(f"{k}={v}" for k, v in accelerator.unwrap_model(policy).config.normalization_mapping.items())
+                logging.info(colored(f"  > Saving config.json with normalization_mapping: [{norm_map_str}]", "green"))
                 original_repo_id = cfg.policy.repo_id
                 # Smart naming: append step count
                 cfg.policy.repo_id = f"{original_repo_id}-step-{step}"
@@ -587,14 +769,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     )
                     card.save(str(saved_path / "README.md"))
 
-                    api.upload_folder(
-                        repo_id=cfg.policy.repo_id,
-                        repo_type="model",
-                        folder_path=str(saved_path),
-                        commit_message=f"Upload checkpoint for step {step}",
-                        allow_patterns=["*.safetensors", "*.json", "*.yaml", "*.md"],
-                        ignore_patterns=["*.tmp", "*.log"],
-                    )
+                    api.upload_folder(repo_id=cfg.policy.repo_id, repo_type="model", folder_path=str(saved_path), commit_message=f"Upload checkpoint for step {step}", allow_patterns=["*.safetensors", "*.json", "*.yaml", "*.md"], ignore_patterns=["*.tmp", "*.log"])
 
                 # Restore original repo_id for the next steps
                 cfg.policy.repo_id = original_repo_id
@@ -627,19 +802,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     logging.info("Suite %s aggregated: %s", suite, suite_info)
 
                 # meters/tracker
-                eval_metrics = {
-                    "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
-                    "pc_success": AverageMeter("success", ":.1f"),
-                    "eval_s": AverageMeter("eval_s", ":.3f"),
-                }
-                eval_tracker = MetricsTracker(
-                    cfg.batch_size,
-                    dataset.num_frames,
-                    dataset.num_episodes,
-                    eval_metrics,
-                    initial_step=step,
-                    accelerator=accelerator,
-                )
+                eval_metrics = {"avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),"pc_success": AverageMeter("success", ":.1f"),"eval_s": AverageMeter("eval_s", ":.3f"),}
+                eval_tracker = MetricsTracker(cfg.batch_size,dataset.num_frames,dataset.num_episodes,eval_metrics,initial_step=step,accelerator=accelerator,)
                 eval_tracker.eval_s = aggregated.pop("eval_s")
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
@@ -658,6 +822,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if cfg.policy.push_to_hub:
             unwrapped_policy = accelerator.unwrap_model(policy)
+            norm_map_str = ", ".join(f"{k}={v}" for k, v in unwrapped_policy.config.normalization_mapping.items())
+            logging.info(colored(f"Final push — saving config.json with normalization_mapping: [{norm_map_str}]", "green"))
             if cfg.policy.use_peft:
                 unwrapped_policy.push_model_to_hub(cfg, peft_model=unwrapped_policy)
             else:

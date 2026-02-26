@@ -87,6 +87,10 @@ class XVLAConfig(PreTrainedConfig):
     max_action_dim: int = 20  # Maximum action dimension for padding (used by "auto" action mode)
     domain_feature_key: str | None = None
     domain_id: int = 0  # Domain ID for multi-task/domain models
+    
+    # Gripper processing parameters
+    gripper_open_threshold: float = 12.0  # Values > threshold will be targeted as 1.0 (open)
+    gripper_max_value: float = 24.0       # Open (1.0) predictions will be scaled to this value during inference
 
     # Vision preprocessing
     resize_imgs_with_padding: tuple[int, int] | None = None

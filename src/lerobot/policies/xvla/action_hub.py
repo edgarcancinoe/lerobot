@@ -68,8 +68,9 @@ class BaseActionSpace(nn.Module):
     dim_action: int = 0
     gripper_idx: tuple[int, ...] = ()
 
-    def __init__(self):
+    def __init__(self, config=None, **kwargs):
         super().__init__()
+        self.config = config
 
     # ---------------------------------------------------------------------
     # Core supervised loss
@@ -125,8 +126,8 @@ class EE6DActionSpace(BaseActionSpace):
     ROT_IDX_1 = (3, 4, 5, 6, 7, 8)
     ROT_IDX_2 = (13, 14, 15, 16, 17, 18)
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, config=None, **kwargs):
+        super().__init__(config=config, **kwargs)
         self.mse = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss()
 
@@ -181,8 +182,8 @@ class JointActionSpace(BaseActionSpace):
     GRIPPER_SCALE = 0.1
     JOINTS_SCALE = 1.0
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, config=None, **kwargs):
+        super().__init__(config=config, **kwargs)
         self.mse = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss()
 
@@ -231,8 +232,8 @@ class AGIBOTEE6DActionSpace(BaseActionSpace):
     ROT_IDX_1 = (3, 4, 5, 6, 7, 8)
     ROT_IDX_2 = (13, 14, 15, 16, 17, 18)
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, config=None, **kwargs):
+        super().__init__(config=config, **kwargs)
         self.mse = nn.MSELoss()
 
     def compute_loss(self, pred, target):
@@ -282,8 +283,8 @@ class FrankaJoint7ActionSpace(BaseActionSpace):
 
     JOINTS_SCALE = 1.0
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, config=None, **kwargs):
+        super().__init__(config=config, **kwargs)
         self.mse = nn.MSELoss()
 
     def _pad_to_model_dim(self, x: torch.Tensor) -> torch.Tensor:
@@ -359,8 +360,8 @@ class AutoActionSpace(BaseActionSpace):
 
     JOINTS_SCALE = 1.0
 
-    def __init__(self, real_dim: int, max_dim: int):
-        super().__init__()
+    def __init__(self, real_dim: int, max_dim: int, config=None, **kwargs):
+        super().__init__(config=config, **kwargs)
         self.real_dim = real_dim
         self.dim_action = max_dim  # Model-facing dimension
         self.mse = nn.MSELoss()
@@ -458,8 +459,8 @@ class BimanualSO101ActionSpace(BaseActionSpace):
     LEFT_ARM_JOINTS = (0, 1, 2, 3, 4)
     RIGHT_ARM_JOINTS = (6, 7, 8, 9, 10)
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, config=None, **kwargs):
+        super().__init__(config=config, **kwargs)
         self.mse = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss()
 
@@ -604,10 +605,12 @@ class SO101EE6DActionSpace(BaseActionSpace):
 
     gripper_idx = (9,)  # within model-space (same position after slicing)
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, config=None, **kwargs):
+        super().__init__(config=config, **kwargs)
         self.mse = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss()
+        self.gripper_thresh = self.config.gripper_open_threshold
+        self.gripper_max = self.config.gripper_max_value
 
     # ------------------------------------------------------------------
     # Helpers
@@ -649,7 +652,11 @@ class SO101EE6DActionSpace(BaseActionSpace):
 
         pos_loss     = self.mse(p[..., self.POS_IDX],  t[..., self.POS_IDX])  * self.XYZ_SCALE
         rot_loss     = self.mse(p[..., self.ROT_IDX],  t[..., self.ROT_IDX])  * self.ROT_SCALE
-        gripper_loss = self.bce(p[..., self.GRIP_IDX], t[..., self.GRIP_IDX]) * self.GRIPPER_SCALE
+        
+        # Binarize gripper targets before BCE
+        t_grip = t[..., self.GRIP_IDX]
+        t_grip_bin = (t_grip > self.gripper_thresh).float()
+        gripper_loss = self.bce(p[..., self.GRIP_IDX], t_grip_bin) * self.GRIPPER_SCALE
 
         return {
             "position_loss": pos_loss,
@@ -673,8 +680,8 @@ class SO101EE6DActionSpace(BaseActionSpace):
         return proprio_m, action_m
 
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
-        """Apply sigmoid to gripper logit and trim to 10D EEF."""
-        action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)])
+        """Apply sigmoid to gripper logit, map to real motor bounds, and trim to 10D EEF."""
+        action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)]) * self.gripper_max
         return self._trim_to_real_dim(action)
 
 
@@ -711,10 +718,12 @@ class SO101JointActionSpace(BaseActionSpace):
 
     gripper_idx = (5,)  # within extracted 6D space
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, config=None, **kwargs):
+        super().__init__(config=config, **kwargs)
         self.mse = nn.MSELoss()
         self.bce = nn.BCEWithLogitsLoss()
+        self.gripper_thresh = self.config.gripper_open_threshold
+        self.gripper_max = self.config.gripper_max_value
 
     # ------------------------------------------------------------------
     # Helpers
@@ -757,7 +766,11 @@ class SO101JointActionSpace(BaseActionSpace):
         t = target[..., : self.REAL_DIM]
 
         joints_loss  = self.mse(p[..., self.JOINTS_IDX], t[..., self.JOINTS_IDX]) * self.JOINTS_SCALE
-        gripper_loss = self.bce(p[..., self.GRIP_IDX],   t[..., self.GRIP_IDX])   * self.GRIPPER_SCALE
+        
+        # Binarize gripper targets before BCE
+        t_grip = t[..., self.GRIP_IDX]
+        t_grip_bin = (t_grip > self.gripper_thresh).float()
+        gripper_loss = self.bce(p[..., self.GRIP_IDX],   t_grip_bin)   * self.GRIPPER_SCALE
 
         return {
             "joints_loss":  joints_loss,
@@ -780,8 +793,8 @@ class SO101JointActionSpace(BaseActionSpace):
         return proprio_m, action_m
 
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
-        """Apply sigmoid to gripper logit and trim to 6D joints."""
-        action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)])
+        """Apply sigmoid to gripper logit, map to real motor bounds, and trim to 6D joints."""
+        action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)]) * self.gripper_max
         return self._trim_to_real_dim(action)
 
 

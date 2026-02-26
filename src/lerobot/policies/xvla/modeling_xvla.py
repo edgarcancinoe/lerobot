@@ -66,11 +66,12 @@ class XVLAModel(nn.Module):
             )
             self.action_space = build_action_space(
                 config.action_mode.lower(),
+                config=config,
                 real_dim=real_dim,
                 max_dim=config.max_action_dim,
             )
         else:
-            self.action_space = build_action_space(config.action_mode.lower())
+            self.action_space = build_action_space(config.action_mode.lower(), config=config)
 
         self.dim_action = self.action_space.dim_action
         self.dim_proprio = proprio_dim
@@ -226,7 +227,8 @@ class XVLAModel(nn.Module):
             proprio=proprio_m,
             **enc,
         )
-        return self.action_space.compute_loss(pred_action, action)
+        loss_dict = self.action_space.compute_loss(pred_action, action)
+        return loss_dict, pred_action
 
     @torch.no_grad()
     def generate_actions(
@@ -297,6 +299,9 @@ class XVLAPolicy(PreTrainedPolicy):
 
     def _prepare_state(self, batch: dict[str, Tensor], batch_size: int, device: torch.device) -> Tensor:
         if not self.config.use_proprio or OBS_STATE not in batch:
+            if OBS_STATE not in batch:
+                from termcolor import colored
+                logging.warning(colored(f"  [XVLA Policy] WARNING: '{OBS_STATE}' missing from batch, substituting with zeros (should not happe...?).", "yellow", attrs=["bold"]))
             return torch.zeros(batch_size, 0, device=device)
         state = batch[OBS_STATE]
         if state.ndim > 2:
@@ -357,6 +362,12 @@ class XVLAPolicy(PreTrainedPolicy):
         if candidate.shape[0] != batch_size:
             candidate = candidate.expand(batch_size)
         return candidate.to(dtype=torch.long)
+    
+    # ========================================================================================================
+    # ========================================================================================================
+    # THIS IS WHAT WE WANT TO PREDICT
+    # ========================================================================================================
+    # ========================================================================================================
 
     def _prepare_action_targets(self, batch: dict[str, Tensor]) -> Tensor:
         if ACTION not in batch:
@@ -368,6 +379,10 @@ class XVLAPolicy(PreTrainedPolicy):
         if actions.shape[-1] != self.model.dim_action:
             actions = pad_vector(actions, self.model.dim_action)
         return actions
+
+    # ========================================================================================================
+    # THIS IS WHAT THE MODEL CAN SEE FOR INFERENCE   XXX  
+    # ========================================================================================================
 
     def _build_model_inputs(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         input_ids = batch[OBS_LANGUAGE_TOKENS]
@@ -386,11 +401,12 @@ class XVLAPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         inputs = self._build_model_inputs(batch)
         targets = self._prepare_action_targets(batch)
-        losses = self.model(action=targets, **inputs)
+        losses, pred_action = self.model(action=targets, **inputs)
         total_loss = sum(losses.values())
 
         log_dict = {k: v.detach().item() for k, v in losses.items()}
         log_dict["loss"] = total_loss.detach().item()
+        log_dict["pred_action"] = pred_action.detach()
         return total_loss, log_dict
 
     def _get_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
