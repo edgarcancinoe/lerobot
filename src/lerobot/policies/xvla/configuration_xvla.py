@@ -86,6 +86,7 @@ class XVLAConfig(PreTrainedConfig):
     max_state_dim: int = 32
     max_action_dim: int = 20  # Maximum action dimension for padding (used by "auto" action mode)
     domain_feature_key: str | None = None
+    domain_id: int = 0  # Domain ID for multi-task/domain models
 
     # Vision preprocessing
     resize_imgs_with_padding: tuple[int, int] | None = None
@@ -143,15 +144,7 @@ class XVLAConfig(PreTrainedConfig):
         return self._florence_config_obj
 
     def validate_features(self) -> None:
-        if not self.image_features:
-            raise ValueError("XVLA requires at least one visual feature in the inputs.")
-        if self.use_proprio and self.robot_state_feature is None:
-            raise ValueError("`use_proprio=True` requires a proprioceptive state feature.")
-        if self.num_image_views is None:
-            self.num_image_views = len(self.image_features) + self.empty_cameras
-        else:
-            self.num_image_views = max(self.num_image_views, len(self.image_features) + self.empty_cameras)
-
+        print(f"[DEBUG-FINAL] Validating... empty_cameras={self.empty_cameras}, num_image_views={self.num_image_views}, image_features len={len(self.image_features)}")
         if self.empty_cameras > 0:
             height, width = (480, 640)
             if self.resize_imgs_with_padding is not None:
@@ -163,6 +156,11 @@ class XVLAConfig(PreTrainedConfig):
                         type=FeatureType.VISUAL,
                         shape=(3, height, width),
                     )
+
+        if self.num_image_views is None:
+            self.num_image_views = len(self.image_features)
+        else:
+            self.num_image_views = max(self.num_image_views, len(self.image_features))
 
     def get_optimizer_preset(self) -> XVLAAdamWConfig:
         """Return the XVLA-specific optimizer with differential learning rates.

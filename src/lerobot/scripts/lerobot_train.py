@@ -24,7 +24,6 @@ import torch
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
-from tqdm import tqdm
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -52,7 +51,6 @@ from lerobot.utils.utils import (
     format_big_number,
     has_method,
     init_logging,
-    inside_slurm,
 )
 
 
@@ -142,6 +140,12 @@ def update_policy(
     # Update internal buffers if policy has update method
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+
+    # Batched Augmentation on GPU
+    if hasattr(policy, "image_augmenter") and policy.image_augmenter is not None:
+        image_keys = [k for k in batch.keys() if "image" in k]
+        for key in image_keys:
+            batch[key] = policy.image_augmenter(batch[key])
 
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
@@ -248,6 +252,33 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
 
+    if is_main_process:
+        logging.info("Policy Config:")
+        logging.info(pformat(dataclasses.asdict(policy.config)))
+
+    # Move custom augmenter from dataset to policy and to device for GPU-side augmentation
+    if hasattr(dataset, "image_augmenter") and dataset.image_augmenter is not None:
+        policy.image_augmenter = dataset.image_augmenter.to(device)
+        if is_main_process:
+            logging.info("✓ Custom image augmenter transferred to GPU (batched mode enabled)")
+
+    if is_main_process:
+        # Debugging for xVLA action mode and dimensions
+        if hasattr(policy, "model") and hasattr(policy.model, "action_space"):
+            action_mode = getattr(cfg.policy, "action_mode", "N/A")
+            dim_action = policy.model.dim_action
+            logging.info(colored(f"XVLA Action Configuration:", "cyan", attrs=["bold"]))
+            logging.info(f"  > Action Mode: {action_mode}")
+            logging.info(f"  > Expected Action Dim (Model): {dim_action}")
+            
+            # Check if this matches the dataset action dim if possible
+            if "action" in dataset.meta.features:
+                feat = dataset.meta.features["action"]
+                ds_action_dim = feat["shape"][0] if isinstance(feat, dict) else feat.shape[0]
+                logging.info(f"  > Dataset Action Dim: {ds_action_dim}")
+                if action_mode == "auto" and ds_action_dim != dim_action:
+                    logging.warning(f"  ! Action dim mismatch in 'auto' mode: model={dim_action}, dataset={ds_action_dim}")
+
     # Create processors - only provide dataset_stats if not resuming from saved processors
     processor_kwargs = {}
     postprocessor_kwargs = {}
@@ -278,13 +309,32 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "norm_map": policy.config.normalization_mapping,
             },
         }
-
+    print(cfg.policy)
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+
+    if is_main_process:
+        logging.info(colored("Processor Pipelines:", "cyan", attrs=["bold"]))
+        logging.info(f"  > Preprocessor steps: {[type(s).__name__ for s in preprocessor.steps]}")
+        logging.info(f"  > Postprocessor steps: {[type(s).__name__ for s in postprocessor.steps]}")
+        
+        # Explicit check for XVLAImageToFloatProcessorStep
+        has_float_step = any("XVLAImageToFloat" in type(s).__name__ for s in preprocessor.steps)
+        if has_float_step:
+            logging.info(colored("  ✓ XVLAImageToFloatProcessorStep is present in pipeline", "green"))
+        else:
+            logging.error(colored("  ✗ XVLAImageToFloatProcessorStep is MISSING from pipeline!", "red"))
+
+        # Log Rename Map details
+        if cfg.rename_map:
+            logging.info(colored("  Image Mapping (Rename Map):", "cyan"))
+            for src, dst in cfg.rename_map.items():
+                if "image" in src or "image" in dst:
+                    logging.info(f"    [MAPPING] {src}  --->  {dst}")
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
@@ -392,14 +442,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     )
 
     if is_main_process:
-        progbar = tqdm(
-            total=cfg.steps - step,
-            desc="Training",
-            unit="step",
-            disable=inside_slurm(),
-            position=0,
-            leave=True,
-        )
         logging.info(
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
@@ -407,7 +449,37 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
+        
+        # Debugging for first batch
+        if step == 0 and is_main_process:
+            logging.info(colored("First batch debugging (Before Preprocessing):", "yellow"))
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    stats = f" | min={v.min().item():.3f}, max={v.max().item():.3f}" if "image" in k or "observation" in k else ""
+                    logging.info(f"  > {k}: {v.shape} ({v.dtype}){stats}")
+        
         batch = preprocessor(batch)
+        
+        # Debugging for post-preprocessed batch
+        if step == 0 and is_main_process:
+            logging.info(colored("Post-preprocessed batch debugging (After Preprocessing):", "yellow"))
+            # Identify what happened to the image keys
+            for dst in ["observation.images.image", "observation.images.image2"]:
+                if dst in batch:
+                    # Find original source if possible
+                    src = "Unknown"
+                    if cfg.rename_map:
+                        for s, d in cfg.rename_map.items():
+                            if d == dst:
+                                src = s
+                                break
+                    logging.info(colored(f"  [PIPELINE OUTPUT] {dst} (derived from {src})", "green"))
+
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    stats = f" | min={v.min().item():.3f}, max={v.max().item():.3f}" if "image" in k or "observation" in k else ""
+                    logging.info(f"  > {k}: {v.shape} ({v.dtype}){stats}")
+        
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
         train_tracker, output_dict = update_policy(
@@ -424,8 +496,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
         step += 1
-        if is_main_process:
-            progbar.update(1)
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
@@ -467,6 +537,27 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
+
+            accelerator.wait_for_everyone()
+
+        is_push_step = cfg.push_every > 0 and step % cfg.push_every == 0 and step != cfg.steps
+        if is_push_step:
+            if is_main_process:
+                logging.info(f"Pushing checkpoint to Hub after step {step}")
+                original_repo_id = cfg.policy.repo_id
+                # Smart naming: append step count
+                cfg.policy.repo_id = f"{original_repo_id}-step-{step}"
+
+                unwrapped_policy = accelerator.unwrap_model(policy)
+                if cfg.policy.use_peft:
+                    unwrapped_policy.push_model_to_hub(cfg, peft_model=unwrapped_policy)
+                else:
+                    unwrapped_policy.push_model_to_hub(cfg)
+                preprocessor.push_to_hub(cfg.policy.repo_id)
+                postprocessor.push_to_hub(cfg.policy.repo_id)
+
+                # Restore original repo_id for the next steps
+                cfg.policy.repo_id = original_repo_id
 
             accelerator.wait_for_everyone()
 
@@ -518,9 +609,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
-
-    if is_main_process:
-        progbar.close()
 
     if eval_env:
         close_envs(eval_env)

@@ -304,8 +304,11 @@ class _NormalizationMixin:
         """
         norm_mode = self.norm_map.get(feature_type, NormalizationMode.IDENTITY)
         if norm_mode == NormalizationMode.IDENTITY or key not in self._tensor_stats:
+            # print(f"[DEBUG] Skipping normalization for key='{key}': mode={norm_mode}, has_stats={key in self._tensor_stats}")
             return tensor
-
+        # else:
+        #     print(f"[DEBUG] Normalizing key='{key}': mode={norm_mode}")
+            
         if norm_mode not in (
             NormalizationMode.MEAN_STD,
             NormalizationMode.MIN_MAX,

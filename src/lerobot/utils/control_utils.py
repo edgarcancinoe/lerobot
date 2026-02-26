@@ -152,11 +152,11 @@ def init_keyboard_listener():
                 print("Right arrow key pressed. Exiting loop...")
                 events["exit_early"] = True
             elif key == keyboard.Key.left:
-                print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+                print("Left arrow key pressed. Resetting robot...")
                 events["rerecord_episode"] = True
                 events["exit_early"] = True
             elif key == keyboard.Key.esc:
-                print("Escape key pressed. Stopping data recording...")
+                print("Escape key pressed. Stopping...")
                 events["stop_recording"] = True
                 events["exit_early"] = True
         except Exception as e:
@@ -189,7 +189,7 @@ def sanity_check_dataset_name(repo_id, policy_cfg):
     # Check if dataset_name starts with "eval_" but policy is missing
     if dataset_name.startswith("eval_") and policy_cfg is None:
         raise ValueError(
-            f"Your dataset name begins with 'eval_' ({dataset_name}), but no policy is provided."
+            f"Your dataset name begins with 'eval_' ({dataset_name}), but no policy is provided ({policy_cfg.type})."
         )
 
     # Check if dataset_name does not start with "eval_" but policy is provided

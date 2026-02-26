@@ -571,6 +571,220 @@ class BimanualSO101ActionSpace(BaseActionSpace):
         return self._trim_to_real_dim(action)
 
 
+@register_action("so101_ee6d")
+class SO101EE6DActionSpace(BaseActionSpace):
+    """
+    SO101 End-Effector (EEF) action space.
+
+    Dataset layout (16D vector stored in 'action' column):
+      [0:3]   xyz position
+      [3:9]   6D rotation (rot6d)
+      [9]     gripper
+      [10:16] joint motor positions (ignored / sliced away)
+
+    This space extracts dims [0:10], applies EEF-specific losses
+    (XYZ / rotation / gripper), and pads to 20D for the model.
+    """
+
+    # Model architecture always expects 20D
+    dim_action = 20
+
+    # Real EEF dimensions in the dataset
+    REAL_DIM = 10
+
+    # Sub-indices *within* the 10D EEF slice
+    POS_IDX  = (0, 1, 2)           # xyz
+    ROT_IDX  = (3, 4, 5, 6, 7, 8)  # 6D rotation
+    GRIP_IDX = (9,)                 # gripper
+
+    # Loss weights
+    XYZ_SCALE     = 500.0
+    ROT_SCALE     = 10.0
+    GRIPPER_SCALE = 1.0
+
+    gripper_idx = (9,)  # within model-space (same position after slicing)
+
+    def __init__(self):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.bce = nn.BCEWithLogitsLoss()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _slice_eef(self, x: torch.Tensor) -> torch.Tensor:
+        """Keep only the first 10 dims (EEF) from the 16D dataset vector."""
+        return x[..., : self.REAL_DIM]
+
+    def _pad_to_model_dim(self, x: torch.Tensor) -> torch.Tensor:
+        """Pad 10D EEF → 20D model space (zeros for extra channels)."""
+        if x is None:
+            return None
+        if x.size(-1) == self.dim_action:
+            return x
+        if x.size(-1) > self.REAL_DIM:
+            # Dataset is 16D — slice first
+            x = self._slice_eef(x)
+        pad_shape = list(x.shape[:-1]) + [self.dim_action - self.REAL_DIM]
+        return torch.cat([x, x.new_zeros(pad_shape)], dim=-1)
+
+    def _trim_to_real_dim(self, x: torch.Tensor) -> torch.Tensor:
+        return x[..., : self.REAL_DIM]
+
+    # ------------------------------------------------------------------
+    # Loss
+    # ------------------------------------------------------------------
+    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        """
+        pred:   [B, T, 20] from model
+        target: [B, T, 16] from dataset OR [B, T, 20] already padded
+        """
+        pred   = self._pad_to_model_dim(pred)
+        target = self._pad_to_model_dim(target)
+        assert pred.shape == target.shape, f"Shape mismatch: {pred.shape} vs {target.shape}"
+
+        # Work on the 10D EEF slice only
+        p = pred[...,   : self.REAL_DIM]
+        t = target[..., : self.REAL_DIM]
+
+        pos_loss     = self.mse(p[..., self.POS_IDX],  t[..., self.POS_IDX])  * self.XYZ_SCALE
+        rot_loss     = self.mse(p[..., self.ROT_IDX],  t[..., self.ROT_IDX])  * self.ROT_SCALE
+        gripper_loss = self.bce(p[..., self.GRIP_IDX], t[..., self.GRIP_IDX]) * self.GRIPPER_SCALE
+
+        return {
+            "position_loss": pos_loss,
+            "rotate6D_loss": rot_loss,
+            "gripper_loss":  gripper_loss,
+        }
+
+    # ------------------------------------------------------------------
+    # Pre / Post
+    # ------------------------------------------------------------------
+    def preprocess(self, proprio: torch.Tensor, action: torch.Tensor, mode: str = "train"):
+        """
+        - Slice EEF from possibly-16D proprio/action
+        - Zero-out gripper channel during diffusion
+        - Pad to 20D for the model
+        """
+        proprio_m = self._pad_to_model_dim(self._slice_eef(proprio).clone())
+        action_m  = self._pad_to_model_dim(self._slice_eef(action).clone())
+        proprio_m[..., self.GRIP_IDX] = 0.0
+        action_m[...,  self.GRIP_IDX] = 0.0
+        return proprio_m, action_m
+
+    def postprocess(self, action: torch.Tensor) -> torch.Tensor:
+        """Apply sigmoid to gripper logit and trim to 10D EEF."""
+        action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)])
+        return self._trim_to_real_dim(action)
+
+
+@register_action("so101_joint")
+class SO101JointActionSpace(BaseActionSpace):
+    """
+    SO101 Joint-space action space.
+
+    Dataset layout (16D vector stored in 'action' column):
+      [0:10]  EEF data (ignored / sliced away)
+      [10:15] joint motor positions (shoulder_pan, shoulder_lift,
+                                     elbow_flex, wrist_flex, wrist_roll)
+      [15]    gripper
+
+    This space extracts dims [10:16], applies joint-specific losses
+    (MSE for joints, BCE for gripper), and pads to 20D for the model.
+    """
+
+    # Model architecture always expects 20D
+    dim_action = 20
+
+    # Slice of the 16D vector that belongs to joints
+    JOINT_SLICE_START = 10
+    JOINT_SLICE_END   = 16   # exclusive
+    REAL_DIM          = 6   # == JOINT_SLICE_END - JOINT_SLICE_START
+
+    # Sub-indices *within* the extracted 6D joint slice
+    JOINTS_IDX = (0, 1, 2, 3, 4)  # 5 motor joints
+    GRIP_IDX   = (5,)              # gripper
+
+    # Loss weights
+    JOINTS_SCALE  = 1.0
+    GRIPPER_SCALE = 0.1
+
+    gripper_idx = (5,)  # within extracted 6D space
+
+    def __init__(self):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.bce = nn.BCEWithLogitsLoss()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _slice_joints(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract the 6D joint slice [10:16] from the 16D dataset vector."""
+        if x.size(-1) == self.REAL_DIM:
+            return x  # already sliced
+        return x[..., self.JOINT_SLICE_START : self.JOINT_SLICE_END]
+
+    def _pad_to_model_dim(self, x: torch.Tensor) -> torch.Tensor:
+        """Pad 6D joints → 20D model space."""
+        if x is None:
+            return None
+        if x.size(-1) == self.dim_action:
+            return x
+        # Ensure we start from the 6D slice
+        if x.size(-1) != self.REAL_DIM:
+            x = self._slice_joints(x)
+        pad_shape = list(x.shape[:-1]) + [self.dim_action - self.REAL_DIM]
+        return torch.cat([x, x.new_zeros(pad_shape)], dim=-1)
+
+    def _trim_to_real_dim(self, x: torch.Tensor) -> torch.Tensor:
+        return x[..., : self.REAL_DIM]
+
+    # ------------------------------------------------------------------
+    # Loss
+    # ------------------------------------------------------------------
+    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        """
+        pred:   [B, T, 20] from model
+        target: [B, T, 16] from dataset OR [B, T, 20] already padded
+        """
+        pred   = self._pad_to_model_dim(pred)
+        target = self._pad_to_model_dim(target)
+        assert pred.shape == target.shape, f"Shape mismatch: {pred.shape} vs {target.shape}"
+
+        # Work on the 6D joint slice only
+        p = pred[...,   : self.REAL_DIM]
+        t = target[..., : self.REAL_DIM]
+
+        joints_loss  = self.mse(p[..., self.JOINTS_IDX], t[..., self.JOINTS_IDX]) * self.JOINTS_SCALE
+        gripper_loss = self.bce(p[..., self.GRIP_IDX],   t[..., self.GRIP_IDX])   * self.GRIPPER_SCALE
+
+        return {
+            "joints_loss":  joints_loss,
+            "gripper_loss": gripper_loss,
+        }
+
+    # ------------------------------------------------------------------
+    # Pre / Post
+    # ------------------------------------------------------------------
+    def preprocess(self, proprio: torch.Tensor, action: torch.Tensor, mode: str = "train"):
+        """
+        - Slice joints from possibly-16D proprio/action
+        - Zero-out gripper channel during diffusion
+        - Pad to 20D for the model
+        """
+        proprio_m = self._pad_to_model_dim(self._slice_joints(proprio).clone())
+        action_m  = self._pad_to_model_dim(self._slice_joints(action).clone())
+        proprio_m[..., self.GRIP_IDX] = 0.0
+        action_m[...,  self.GRIP_IDX] = 0.0
+        return proprio_m, action_m
+
+    def postprocess(self, action: torch.Tensor) -> torch.Tensor:
+        """Apply sigmoid to gripper logit and trim to 6D joints."""
+        action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)])
+        return self._trim_to_real_dim(action)
+
+
 # =============================================================================
 # Exports
 # =============================================================================
@@ -584,5 +798,7 @@ __all__ = [
     "FrankaJoint7ActionSpace",
     "AutoActionSpace",
     "BimanualSO101ActionSpace",
+    "SO101EE6DActionSpace",
+    "SO101JointActionSpace",
     "ACTION_REGISTRY",
 ]

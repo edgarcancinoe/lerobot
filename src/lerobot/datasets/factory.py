@@ -80,9 +80,47 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
-    image_transforms = (
-        ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
-    )
+    # Custom Augmentation Integration
+    image_transforms = None
+    if cfg.dataset.image_transforms.enable:
+        import sys
+        from pathlib import Path
+        # Workspace root is 4 levels up: lerobot_src/src/lerobot/datasets/factory.py
+        workspace_root = Path(__file__).resolve().parents[4]
+        if str(workspace_root) not in sys.path:
+            sys.path.append(str(workspace_root))
+        
+        print("\n" + "="*80)
+        print(f"[CRITICAL DEBUG] LOADING CUSTOM AUGMENTATION PIPELINE")
+        print(f"[CRITICAL DEBUG] Workspace root: {workspace_root}")
+        print("="*80)
+        sys.stdout.flush()
+        
+        from utils.augmentations import CustomAugmentationPipeline
+        
+        # Extract parameters from config if available
+        rotation = 15
+        translation = 0.1
+        if "affine" in cfg.dataset.image_transforms.tfs:
+            affine_kwargs = cfg.dataset.image_transforms.tfs["affine"].kwargs
+            if "degrees" in affine_kwargs:
+                degs = affine_kwargs["degrees"]
+                rotation = degs[1] if isinstance(degs, (list, tuple)) else degs
+            if "translate" in affine_kwargs:
+                trans = affine_kwargs["translate"]
+                translation = trans[0] if isinstance(trans, (list, tuple)) else trans
+
+        print(f"[CRITICAL DEBUG] Params: rotation={rotation}, translation={translation}, mode=reflect")
+        image_transforms = CustomAugmentationPipeline(
+            enable_geometric=True,
+            rotation_deg=rotation,
+            translation_frac=translation,
+            fill_mode="reflect",
+            enable_photometric=True,
+        )
+        print("[CRITICAL DEBUG] CUSTOM AUGMENTATION PIPELINE INITIALIZED SUCCESSFULLY")
+        print("="*80 + "\n")
+        sys.stdout.flush()
 
     if isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
@@ -95,7 +133,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
+                image_transforms=None, # DISABLED ON CPU-SIDE FOR PERFORMANCE
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
@@ -106,7 +144,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 root=cfg.dataset.root,
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
+                image_transforms=None, # DISABLED ON CPU-SIDE FOR PERFORMANCE
                 revision=cfg.dataset.revision,
                 max_num_shards=cfg.num_workers,
                 tolerance_s=cfg.tolerance_s,

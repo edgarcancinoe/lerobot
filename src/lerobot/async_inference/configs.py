@@ -143,6 +143,12 @@ class RobotClientConfig:
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
     )
 
+    # Rename map for observation keys (e.g., camera name mapping)
+    rename_map: dict[str, str] = field(
+        default_factory=dict,
+        metadata={"help": "Mapping from robot observation keys to policy expected keys"},
+    )
+
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
