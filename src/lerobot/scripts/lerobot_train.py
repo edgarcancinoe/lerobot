@@ -54,6 +54,7 @@ from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
+import torchvision.utils as vutils
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
@@ -66,46 +67,118 @@ from lerobot.utils.utils import (
     has_method,
     init_logging,
 )
-def debug_batch(batch, tag="", step=0, only_step=0, slice_dim=None):
+def debug_batch(batch, tag="", step=0, only_step=0, slice_dim=None, dataset_meta=None):
     """Call this at any point in the pipeline to inspect tensors."""
     if step != only_step:
         return
     
-    logging.info(colored(f"\n{'='*60}", "magenta", attrs=["bold"]))
+    logging.info(colored(f"\n{'='*70}", "magenta", attrs=["bold"]))
     logging.info(colored(f"[DEBUG] {tag} | step={step}", "magenta", attrs=["bold"]))
-    logging.info(colored(f"{'='*60}", "magenta", attrs=["bold"]))
+    logging.info(colored(f"{'='*70}", "magenta", attrs=["bold"]))
     
     if not batch:
         logging.info(colored("  (Empty dictionary)", "red"))
-    else:
-        for k, v in sorted(batch.items()):
-            padded_key = f"  {k}:".ljust(40)
-            key_str = colored(padded_key, "cyan")
-            
-            if isinstance(v, torch.Tensor):
-                extra = ""
-                if v.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-                    # Handle empty tensors safely
-                    if v.numel() > 0:
-                        extra = f" | min={v.min().item():.4f} max={v.max().item():.4f} mean={v.mean().item():.4f}"
-                        if k == "pred_action" and slice_dim is not None:
-                            try:
-                                mean_1 = v[..., :slice_dim].to(torch.float32).mean().item()
-                                mean_2 = v[..., slice_dim:].to(torch.float32).mean().item()
-                                extra += f" | mean(0:{slice_dim})={mean_1:.4f} mean({slice_dim}:end)={mean_2:.4f}"
-                            except Exception:
-                                pass
-                    else:
-                        extra = " | (empty tensor)"
-                
-                shape_str = f"shape={list(v.shape)} dtype={v.dtype}{extra}"
-                logging.info(f"{key_str} {shape_str}")
-            else:
-                val_str = str(v)
-                if len(val_str) > 60:
-                    val_str = val_str[:57] + "..."
-                logging.info(f"{key_str} type={type(v).__name__} value={val_str}")
+        logging.info("")
+        return
 
+    # Keys to ignore based on user request
+    ignore_keys = {"index", "info", "episode_index"}
+
+    # Custom sort order: action -> observation.state -> action_is_pad -> others
+    def sort_key(k):
+        if k == "action": return (0, k)
+        if k == "observation.state": return (1, k)
+        if k == "action_is_pad": return (2, k)
+        return (3, k)
+
+    sorted_keys = sorted([k for k in batch.keys() if k not in ignore_keys], key=sort_key)
+
+    for k in sorted_keys:
+        v = batch[k]
+        padded_key = f"  {k}:".ljust(40)
+        key_str = colored(padded_key, "cyan")
+        
+        if isinstance(v, torch.Tensor):
+            shape_str = f"shape={list(v.shape)} dtype={v.dtype}"
+            
+            # For specific kinematics tensors we want detailed dim-wise stats
+            if k in ["action", "observation.state", "pred_action"] and v.numel() > 0 and v.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                logging.info(f"{key_str} {shape_str}")
+                
+                # Fetch name labels like in log_processor_stats
+                # Determine how many dimensions the tensor's last axis has
+                num_dims = v.size(-1)
+                
+                feat_names = None
+                meta_k = "action" if k == "pred_action" else k
+                if dataset_meta and meta_k in dataset_meta.features:
+                    feature_info = dataset_meta.features[meta_k]
+                    if isinstance(feature_info, dict):
+                        feat_names = feature_info.get("names")
+                    elif hasattr(feature_info, "names"):
+                        feat_names = feature_info.names
+                
+                name_width = 15
+                header_str = f"    {'Dim Name':<{name_width}} | {'min':<8} | {'max':<8} | {'mean':<8}"
+                logging.info(colored(f"    {'-' * (len(header_str) - 4)}", "green"))
+                logging.info(colored(header_str, "green", attrs=["bold"]))
+                logging.info(colored(f"    {'-' * (len(header_str) - 4)}", "green"))
+                
+                # We calculate stats across batch & sequence (all except the last dim)
+                # Reshape to (-1, num_dims)
+                v_flat = v.reshape(-1, num_dims).float()
+                v_min = v_flat.min(dim=0).values
+                v_max = v_flat.max(dim=0).values
+                v_mean = v_flat.mean(dim=0)
+                
+                separator_printed = False
+                for i in range(num_dims):
+                    dim_name = f"Dim {i}"
+                    
+                    # If this is pred_action and we exceed the true action space defined by dataset_meta, treat as padding
+                    is_padding = False
+                    if slice_dim is not None and i >= slice_dim:
+                        is_padding = True
+                    elif feat_names is not None:
+                        if i < len(feat_names):
+                            d_name = feat_names[i]
+                            if isinstance(d_name, dict) and 'name' in d_name:
+                                dim_name = d_name['name']
+                            elif isinstance(d_name, str):
+                                dim_name = d_name
+                        else:
+                            is_padding = True
+                    
+                    if "pad" in dim_name.lower():
+                        is_padding = True
+                    
+                    if len(dim_name) > name_width:
+                        dim_name = dim_name[:name_width-2] + ".."
+                        
+                    # Print a visually distinct separator if we transition into padding territory
+                    if not separator_printed and is_padding:
+                        logging.info(colored(f"    {' ':<{name_width}} | {'--- padding ---':^28}", "cyan", attrs=["bold"]))
+                        separator_printed = True
+                        
+                    row_str = f"    {dim_name:<{name_width}} | {v_min[i].item():>8.4f} | {v_max[i].item():>8.4f} | {v_mean[i].item():>8.4f}"
+                    logging.info(colored(row_str, "green"))
+                logging.info(colored(f"    {'-' * (len(header_str) - 4)}", "green"))
+                
+            else:
+                extra = ""
+                # Overall stats for images or other numeric tensors
+                if v.numel() > 0 and v.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                    extra = f" | min={v.min().item():.4f} max={v.max().item():.4f} mean={v.mean().item():.4f}"
+                elif v.numel() == 0:
+                    extra = " | (empty tensor)"
+                
+                logging.info(f"{key_str} {shape_str}{extra}")
+        else:
+            val_str = str(v)
+            if len(val_str) > 60:
+                val_str = val_str[:57] + "..."
+            logging.info(f"{key_str} type={type(v).__name__} value={val_str}")
+            
     logging.info("")
 
 def log_processor_stats(step, dataset_meta=None):
@@ -150,7 +223,6 @@ def log_processor_stats(step, dataset_meta=None):
             logging.info(colored(f"  {'-' * (len(header_str) - 2)}", "green"))
             logging.info(colored(header_str, "green", attrs=["bold"]))
             logging.info(colored(f"  {'-' * (len(header_str) - 2)}", "green"))
-            
             for i in range(num_dims):
                 dim_name = f"Dim {i}"
                 if feat_names is not None and i < len(feat_names):
@@ -159,13 +231,7 @@ def log_processor_stats(step, dataset_meta=None):
                         dim_name = d_name['name']
                     elif isinstance(d_name, str):
                         dim_name = d_name
-                elif num_dims == 10 and feat_key in ["action", "observation.state"]:
-                    default_names = ["x", "y", "z", "roll", "pitch", "yaw", "gripper", "pad_1", "pad_2", "pad_3"]
-                    dim_name = default_names[i]
-                elif num_dims == 16 and feat_key in ["action", "observation.state"]:
-                    default_names = ["x", "y", "z", "roll", "pitch", "yaw", "gripper", "mobile_v", "mobile_w", "pad_1", "pad_2", "pad_3", "pad_4", "pad_5", "pad_6", "pad_7"]
-                    if i < len(default_names): dim_name = default_names[i]
-                
+
                 if len(dim_name) > name_width:
                     dim_name = dim_name[:name_width-2] + ".."
                 
@@ -189,6 +255,72 @@ def log_processor_stats(step, dataset_meta=None):
                 
             logging.info(colored(f"  {'-' * (len(header_str) - 2)}", "green"))
         logging.info(colored(f"{'='*70}", "cyan", attrs=["bold"]))
+
+def save_debug_images(batch, output_dir, step=0, prefix="post"):
+    """Save the first frame of the first batch for all image modalities to visualize what the VLM sees."""
+    if step != 0:
+        return
+        
+    vis_dir = os.path.join(output_dir, "visualizations")
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    # Find all keys that look like images
+    image_keys = [k for k in batch.keys() if "images" in k and isinstance(batch[k], torch.Tensor)]
+    if not image_keys:
+        return
+        
+    logging.info(colored(f"\n[DEBUG] Saving {prefix} visualization grids to: {vis_dir}", "yellow", attrs=["bold"]))
+    for k in image_keys:
+        img_tensor = batch[k]
+        if img_tensor.ndim >= 4:  # [B, T, C, H, W] or [B, C, H, W]
+            # Take the first sequence step of the first batch element
+            if img_tensor.ndim == 5:
+                img = img_tensor[0, 0]  # [C, H, W]
+            else:
+                img = img_tensor[0]     # [C, H, W]
+            
+            # Convert to float32 for processing
+            img = img.float()
+            
+            # Smart normalization:
+            # If the values are already in [0, 1] (or close), just use them.
+            # If they are in [0, 255], scale them.
+            # Otherwise (standardized), undo ImageNet normalization if 3 channels.
+            # Format filename safely to use in logging
+            safe_k = k.replace(".", "_")
+            img_min = img.min()
+            img_max = img.max()
+            if img_min >= -0.01 and img_max <= 1.01:
+                # Already mostly in [0, 1]
+                logging.info(f"    [{prefix}_{safe_k}] Using identity normalization (values in [0, 1])")
+                img_normalized = img
+            elif img_min >= -0.1 and img_max > 5.0 and img_max <= 256.0:
+                # Likely [0, 255]
+                logging.info(f"    [{prefix}_{safe_k}] Using /255 normalization (values in [0, 255])")
+                img_normalized = img / 255.0
+            elif img_max > img_min:
+                if img.shape[0] == 3:
+                    # Likely standardized. Inverse ImageNet normalization
+                    logging.info(f"    [{prefix}_{safe_k}] Using inverse ImageNet normalization")
+                    mean = torch.tensor([0.485, 0.456, 0.406], device=img.device).view(3, 1, 1)
+                    std = torch.tensor([0.229, 0.224, 0.225], device=img.device).view(3, 1, 1)
+                    img_normalized = img * std + mean
+                    img_normalized = torch.clamp(img_normalized, 0.0, 1.0)
+                else:
+                    # Fallback to min-max stretch if not 3 channels
+                    logging.info(f"    [{prefix}_{safe_k}] Using min-max stretch fallback (not 3 channels)")
+                    img_normalized = (img - img_min) / (img_max - img_min)
+            else:
+                logging.info(f"    [{prefix}_{safe_k}] Using fallback identity (flat image)")
+                img_normalized = img
+            
+            out_path = os.path.join(vis_dir, f"step_{step}_{prefix}_{safe_k}.jpg")
+            try:
+                vutils.save_image(img_normalized, out_path)
+                logging.info(f"  Saved {out_path}")
+            except Exception as e:
+                logging.warning(f"  Failed to save {out_path}: {e}")
+    logging.info("")
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -322,11 +454,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         force_cpu = cfg.policy.device == "cpu"
         accelerator = Accelerator( step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs], cpu=force_cpu,)
 
-    init_logging(accelerator=accelerator)
-
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
     is_main_process = accelerator.is_main_process
+
+    log_file = None
+    if is_main_process and hasattr(cfg, "output_dir") and cfg.output_dir is not None:
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        log_file = cfg.output_dir / "train.log"
+        
+    init_logging(accelerator=accelerator, log_file=log_file)
 
     # Initialize wandb only on main process
     if cfg.wandb.enable and cfg.wandb.project and is_main_process:
@@ -647,9 +784,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         batch = next(dl_iter)
 
         # PRE PROCESSING
-        debug_batch(batch, tag="RAW (before preprocess)", step=step)
+        debug_batch(batch, tag="RAW (before preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
+        if is_main_process:
+            save_debug_images(batch, cfg.output_dir, step=step, prefix="raw")
+            
         batch = preprocessor(batch)
-        debug_batch(batch, tag="POST (after preprocess)", step=step)
+        debug_batch(batch, tag="POST (after preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
+        if is_main_process:
+            save_debug_images(batch, cfg.output_dir, step=step, prefix="post")
         
         # Use data
         train_tracker.dataloading_s = time.perf_counter() - start_time
@@ -662,7 +804,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             elif "action" in dataset.meta.features:
                 slice_dim = dataset.meta.features["action"].shape[-1] - ACTION_DIM_SLICE_START
 
-        debug_batch(output_dict, tag="MODEL OUTPUT dict", step=step, slice_dim=slice_dim)
+        debug_batch(output_dict, tag="MODEL OUTPUT dict", step=step, slice_dim=slice_dim, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
 
         ##############################################################################################################
         ##############################################################################################################
