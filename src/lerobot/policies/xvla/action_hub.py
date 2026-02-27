@@ -655,7 +655,8 @@ class SO101EE6DActionSpace(BaseActionSpace):
         
         # Binarize gripper targets before BCE
         t_grip = t[..., self.GRIP_IDX]
-        t_grip_bin = (t_grip > self.gripper_thresh).float()
+        t_grip_bin = (t_grip > self.gripper_thresh).float() # Threshold motor degrees into hard 0/1 targets
+        # Note: BCEWithLogitsLoss combines a Sigmoid layer and the BCELoss in one single class. Only predicted values are passed through the sigmoid.
         gripper_loss = self.bce(p[..., self.GRIP_IDX], t_grip_bin) * self.GRIPPER_SCALE
 
         return {
@@ -681,6 +682,7 @@ class SO101EE6DActionSpace(BaseActionSpace):
 
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
         """Apply sigmoid to gripper logit, map to real motor bounds, and trim to 10D EEF."""
+        # Sigmoid brings to (0, 1) range
         action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)]) * self.gripper_max
         return self._trim_to_real_dim(action)
 
