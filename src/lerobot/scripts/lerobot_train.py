@@ -421,7 +421,6 @@ def update_policy(
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
 
-
 @parser.wrap()
 def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     """
@@ -507,6 +506,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         ACTION_DIM_SLICE_START = 10
         ACTION_DIM_SLICE_END = 16  # Joint slice
     
+    # Slice action and state to match the policy's action space
     if hasattr(dataset, "meta") and (ACTION_DIM_SLICE_START != 0 or ACTION_DIM_SLICE_END is not None):
         for key in ["action", "observation.state"]:
             if key in dataset.meta.features and "shape" in dataset.meta.features[key]:
@@ -670,14 +670,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info("  > Preprocessor steps:")
         for s in preprocessor.steps:
             logging.info(f"      - {type(s).__name__}")
-            if type(s).__name__ == "NormalizerProcessorStep":
-                log_processor_stats(s, dataset.meta)
+            # if type(s).__name__ == "NormalizerProcessorStep":
+            log_processor_stats(s, dataset.meta)
                 
         logging.info("  > Postprocessor steps:")
         for s in postprocessor.steps:
             logging.info(f"      - {type(s).__name__}")
-            if type(s).__name__ == "UnnormalizerProcessorStep":
-                log_processor_stats(s, dataset.meta)
+            # if type(s).__name__ == "UnnormalizerProcessorStep":
+            log_processor_stats(s, dataset.meta)
 
         # Log Rename Map details
         if cfg.rename_map:

@@ -683,7 +683,9 @@ class SO101EE6DActionSpace(BaseActionSpace):
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
         """Apply sigmoid to gripper logit, map to real motor bounds, and trim to 10D EEF."""
         # Sigmoid brings to (0, 1) range
+        print("Predicted gripper state (logit): ", action[..., list(self.GRIP_IDX)], self.GRIP_IDX)
         action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)]) * self.gripper_max
+        print("Predicted gripper state after sigmoid: ", action[..., list(self.GRIP_IDX)], self.GRIP_IDX)
         return self._trim_to_real_dim(action)
 
 

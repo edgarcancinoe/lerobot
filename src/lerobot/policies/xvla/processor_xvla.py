@@ -14,6 +14,7 @@
 # limitations under the License.
 # ------------------------------------------------------------------------------
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -60,6 +61,41 @@ def make_xvla_pre_post_processors(
     """
 
     features = {**config.input_features, **config.output_features}
+    
+    # -------------------------------------------------------------------------
+    # Bimanual / Gripper Identity Hack
+    # If the action_mode defines a gripper, we must FORCE identity 
+    # normalization for that dimension. Otherwise, the BCE loss in the ActionSpace
+    # will attempt to threshold normalized z-scores against physical 
+    # degrees, which always fails and results in a 0.0 target.
+    # -------------------------------------------------------------------------
+    if dataset_stats is not None:
+        dataset_stats = deepcopy(dataset_stats)
+        action_mode = getattr(config, 'action_mode', None)
+        
+        grip_idx = None
+        if action_mode == 'so101_ee6d':
+            grip_idx = 9
+        elif action_mode == 'so101_joint':
+            grip_idx = 5
+            
+        if grip_idx is not None:
+            # Force identity (mean=0, std=1) on the gripper dimension for action and state
+            for feature in ["action", "observation.state"]:
+                if feature in dataset_stats:
+                    if "mean" in dataset_stats[feature] and len(dataset_stats[feature]["mean"]) > grip_idx:
+                        # Depending on the dataset_stats backend, these might be lists or tensors
+                        if isinstance(dataset_stats[feature]["mean"], torch.Tensor):
+                            dataset_stats[feature]["mean"][grip_idx] = 0.0
+                        else:
+                            dataset_stats[feature]["mean"][grip_idx] = 0.0
+                            
+                    if "std" in dataset_stats[feature] and len(dataset_stats[feature]["std"]) > grip_idx:
+                        if isinstance(dataset_stats[feature]["std"], torch.Tensor):
+                            dataset_stats[feature]["std"][grip_idx] = 1.0
+                        else:
+                            dataset_stats[feature]["std"][grip_idx] = 1.0
+
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
