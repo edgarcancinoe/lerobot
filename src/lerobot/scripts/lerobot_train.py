@@ -907,7 +907,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if cfg.policy.type == "xvla":
         _assert_xvla_finetune_contract(policy.config)
-        _validate_xvla_sequence_budget(policy, dataset, preprocessor)
+        if is_main_process:
+            _validate_xvla_sequence_budget(policy, dataset, preprocessor)
+        accelerator.wait_for_everyone()
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
