@@ -332,7 +332,6 @@ class _NormalizationMixin:
                 raise ValueError(
                     "MEAN_STD normalization mode requires mean and std stats, please update the dataset with the correct stats"
                 )
-
             mean, std = stats["mean"], stats["std"]
             # Avoid division by zero by adding a small epsilon.
             denom = std + self.eps

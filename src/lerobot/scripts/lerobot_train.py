@@ -788,6 +788,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "norm_map": policy.config.normalization_mapping,
             },
         }
+
         # Custom remap for matching camera names.
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
             "rename_map": cfg.rename_map
@@ -800,6 +801,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "norm_map": policy.config.normalization_mapping,
             },
         }
+
+        logging.info(colored("\n--- PreProcessor overrides ---", "yellow", attrs=["bold"]))
+        if action_mode == 'so101_ee6d':
+            print(processor_kwargs["preprocessor_overrides"]['normalizer_processor']['stats']['observation.state'])
+            print(processor_kwargs["preprocessor_overrides"]['normalizer_processor']['stats']['action'])
+            logging.info(colored("\n--- PostProcessor overrides ---", "yellow", attrs=["bold"]))
+            print(postprocessor_kwargs["postprocessor_overrides"]['unnormalizer_processor'])
+
 
     if is_main_process:
         logging.info(colored("\n--- DATASET PIPELINE CONFIGURATION ---", "yellow", attrs=["bold"]))
@@ -973,18 +982,19 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     for _ in range(step, cfg.steps):
 
         start_time = time.perf_counter()
-        batch = next(dl_iter)
+        raw_batch = next(dl_iter)
 
         # PRE PROCESSING
-        debug_batch(batch, tag="RAW (before preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
-        if is_main_process:
-            save_debug_images(batch, cfg.output_dir, step=step, prefix="raw")
-            
-        batch = preprocessor(batch)
+        debug_batch(raw_batch, tag="RAW (before preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
+        # if is_main_process:
+        #     # Happens only on step 0
+        #     save_debug_images(batch, cfg.output_dir, step=0, prefix="raw")
+   
+        batch = preprocessor(raw_batch)
         debug_batch(batch, tag="POST (after preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
-        if is_main_process:
-            save_debug_images(batch, cfg.output_dir, step=step, prefix="post")
-        
+        # if is_main_process:
+        #     save_debug_images(batch, cfg.output_dir, step=0, prefix="post")
+
         # Use data
         train_tracker.dataloading_s = time.perf_counter() - start_time
         train_tracker, output_dict = update_policy(train_tracker, policy, batch, optimizer, cfg.optimizer.grad_clip_norm, accelerator=accelerator, lr_scheduler=lr_scheduler, rabc_weights_provider=rabc_weights)
