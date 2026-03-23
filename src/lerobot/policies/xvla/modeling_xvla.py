@@ -407,6 +407,10 @@ class XVLAPolicy(PreTrainedPolicy):
         log_dict = {k: v.detach().item() for k, v in losses.items()}
         log_dict["loss"] = total_loss.detach().item()
         log_dict["pred_action"] = pred_action.detach()
+        if getattr(self.config, "enable_gripper_debug_stats", False):
+            gripper_debug_counts = self.model.action_space.compute_gripper_debug_stats(pred_action, targets)
+            if gripper_debug_counts is not None:
+                log_dict["gripper_debug_counts"] = gripper_debug_counts
         return total_loss, log_dict
 
     def _get_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:

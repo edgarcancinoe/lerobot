@@ -21,6 +21,8 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 
+from .action_contract import get_so101_slice_spec
+
 # =============================================================================
 # Registry
 # =============================================================================
@@ -97,6 +99,12 @@ class BaseActionSpace(nn.Module):
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
         """Default: return unchanged."""
         return action
+
+    def compute_gripper_debug_stats(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        """Optional hook for action spaces that want gripper-class diagnostics."""
+        return None
 
 
 # =============================================================================
@@ -590,8 +598,12 @@ class SO101EE6DActionSpace(BaseActionSpace):
     # Model architecture always expects 20D
     dim_action = 20
 
-    # Real EEF dimensions in the dataset
-    REAL_DIM = 10
+    _SLICE_SPEC = get_so101_slice_spec("so101_ee6d")
+    if _SLICE_SPEC is None:
+        raise RuntimeError("Missing slice spec for so101_ee6d.")
+
+    # Real EEF dimensions after dataset slicing
+    REAL_DIM = _SLICE_SPEC.real_dim
 
     # Sub-indices *within* the 10D EEF slice
     POS_IDX  = (0, 1, 2)           # xyz
@@ -615,19 +627,20 @@ class SO101EE6DActionSpace(BaseActionSpace):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _slice_eef(self, x: torch.Tensor) -> torch.Tensor:
-        """Keep only the first 10 dims (EEF) from the 16D dataset vector."""
-        return x[..., : self.REAL_DIM]
+    def _validate_input_dim(self, x: torch.Tensor, name: str) -> torch.Tensor:
+        if x.size(-1) not in (self.REAL_DIM, self.dim_action):
+            raise ValueError(
+                f"{name} must have {self.REAL_DIM} or {self.dim_action} dims, got {x.size(-1)}."
+            )
+        return x
 
     def _pad_to_model_dim(self, x: torch.Tensor) -> torch.Tensor:
         """Pad 10D EEF → 20D model space (zeros for extra channels)."""
         if x is None:
             return None
+        x = self._validate_input_dim(x, "EEF tensor")
         if x.size(-1) == self.dim_action:
             return x
-        if x.size(-1) > self.REAL_DIM:
-            # Dataset is 16D — slice first
-            x = self._slice_eef(x)
         pad_shape = list(x.shape[:-1]) + [self.dim_action - self.REAL_DIM]
         return torch.cat([x, x.new_zeros(pad_shape)], dim=-1)
 
@@ -640,7 +653,7 @@ class SO101EE6DActionSpace(BaseActionSpace):
     def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         pred:   [B, T, 20] from model
-        target: [B, T, 16] from dataset OR [B, T, 20] already padded
+        target: [B, T, 10] from sliced dataset OR [B, T, 20] already padded
         """
         pred   = self._pad_to_model_dim(pred)
         target = self._pad_to_model_dim(target)
@@ -670,23 +683,47 @@ class SO101EE6DActionSpace(BaseActionSpace):
     # ------------------------------------------------------------------
     def preprocess(self, proprio: torch.Tensor, action: torch.Tensor, mode: str = "train"):
         """
-        - Slice EEF from possibly-16D proprio/action
+        - Consume 10D sliced EEF proprio/action
         - Zero-out gripper channel during diffusion
         - Pad to 20D for the model
         """
-        proprio_m = self._pad_to_model_dim(self._slice_eef(proprio).clone())
-        action_m  = self._pad_to_model_dim(self._slice_eef(action).clone())
+        proprio_m = self._pad_to_model_dim(proprio.clone())
+        action_m  = self._pad_to_model_dim(action.clone())
         proprio_m[..., self.GRIP_IDX] = 0.0
         action_m[...,  self.GRIP_IDX] = 0.0
         return proprio_m, action_m
 
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
         """Apply sigmoid to gripper logit, map to real motor bounds, and trim to 10D EEF."""
-        # Sigmoid brings to (0, 1) range
-        print("Predicted gripper state (logit): ", action[..., list(self.GRIP_IDX)], self.GRIP_IDX)
+        action = self._validate_input_dim(action, "EEF action").clone()
         action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)]) * self.gripper_max
-        print("Predicted gripper state after sigmoid: ", action[..., list(self.GRIP_IDX)], self.GRIP_IDX)
         return self._trim_to_real_dim(action)
+
+    def compute_gripper_debug_stats(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        pred = self._pad_to_model_dim(pred)
+        target = self._pad_to_model_dim(target)
+
+        p = pred[..., : self.REAL_DIM]
+        t = target[..., : self.REAL_DIM]
+
+        pred_grip = torch.sigmoid(p[..., self.GRIP_IDX]) * self.gripper_max
+        target_grip = t[..., self.GRIP_IDX]
+
+        pred_bin = pred_grip > self.gripper_thresh
+        target_bin = target_grip > self.gripper_thresh
+
+        return {
+            "target_zero_count": (~target_bin).sum(dtype=torch.int64).detach(),
+            "target_one_count": target_bin.sum(dtype=torch.int64).detach(),
+            "pred_zero_count": (~pred_bin).sum(dtype=torch.int64).detach(),
+            "pred_one_count": pred_bin.sum(dtype=torch.int64).detach(),
+            "true_negative_count": ((~pred_bin) & (~target_bin)).sum(dtype=torch.int64).detach(),
+            "true_positive_count": (pred_bin & target_bin).sum(dtype=torch.int64).detach(),
+            "false_positive_count": (pred_bin & (~target_bin)).sum(dtype=torch.int64).detach(),
+            "false_negative_count": ((~pred_bin) & target_bin).sum(dtype=torch.int64).detach(),
+        }
 
 
 @register_action("so101_joint")
@@ -707,10 +744,11 @@ class SO101JointActionSpace(BaseActionSpace):
     # Model architecture always expects 20D
     dim_action = 20
 
-    # Slice of the 16D vector that belongs to joints
-    JOINT_SLICE_START = 10
-    JOINT_SLICE_END   = 16   # exclusive
-    REAL_DIM          = 6   # == JOINT_SLICE_END - JOINT_SLICE_START
+    _SLICE_SPEC = get_so101_slice_spec("so101_joint")
+    if _SLICE_SPEC is None:
+        raise RuntimeError("Missing slice spec for so101_joint.")
+
+    REAL_DIM = _SLICE_SPEC.real_dim
 
     # Sub-indices *within* the extracted 6D joint slice
     JOINTS_IDX = (0, 1, 2, 3, 4)  # 5 motor joints
@@ -732,21 +770,20 @@ class SO101JointActionSpace(BaseActionSpace):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _slice_joints(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract the 6D joint slice [10:16] from the 16D dataset vector."""
-        if x.size(-1) == self.REAL_DIM:
-            return x  # already sliced
-        return x[..., self.JOINT_SLICE_START : self.JOINT_SLICE_END]
+    def _validate_input_dim(self, x: torch.Tensor, name: str) -> torch.Tensor:
+        if x.size(-1) not in (self.REAL_DIM, self.dim_action):
+            raise ValueError(
+                f"{name} must have {self.REAL_DIM} or {self.dim_action} dims, got {x.size(-1)}."
+            )
+        return x
 
     def _pad_to_model_dim(self, x: torch.Tensor) -> torch.Tensor:
         """Pad 6D joints → 20D model space."""
         if x is None:
             return None
+        x = self._validate_input_dim(x, "Joint tensor")
         if x.size(-1) == self.dim_action:
             return x
-        # Ensure we start from the 6D slice
-        if x.size(-1) != self.REAL_DIM:
-            x = self._slice_joints(x)
         pad_shape = list(x.shape[:-1]) + [self.dim_action - self.REAL_DIM]
         return torch.cat([x, x.new_zeros(pad_shape)], dim=-1)
 
@@ -759,7 +796,7 @@ class SO101JointActionSpace(BaseActionSpace):
     def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
         """
         pred:   [B, T, 20] from model
-        target: [B, T, 16] from dataset OR [B, T, 20] already padded
+        target: [B, T, 6] from sliced dataset OR [B, T, 20] already padded
         """
         pred   = self._pad_to_model_dim(pred)
         target = self._pad_to_model_dim(target)
@@ -786,20 +823,47 @@ class SO101JointActionSpace(BaseActionSpace):
     # ------------------------------------------------------------------
     def preprocess(self, proprio: torch.Tensor, action: torch.Tensor, mode: str = "train"):
         """
-        - Slice joints from possibly-16D proprio/action
+        - Consume 6D sliced joint proprio/action
         - Zero-out gripper channel during diffusion
         - Pad to 20D for the model
         """
-        proprio_m = self._pad_to_model_dim(self._slice_joints(proprio).clone())
-        action_m  = self._pad_to_model_dim(self._slice_joints(action).clone())
+        proprio_m = self._pad_to_model_dim(proprio.clone())
+        action_m  = self._pad_to_model_dim(action.clone())
         proprio_m[..., self.GRIP_IDX] = 0.0
         action_m[...,  self.GRIP_IDX] = 0.0
         return proprio_m, action_m
 
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
         """Apply sigmoid to gripper logit, map to real motor bounds, and trim to 6D joints."""
+        action = self._validate_input_dim(action, "Joint action").clone()
         action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)]) * self.gripper_max
         return self._trim_to_real_dim(action)
+
+    def compute_gripper_debug_stats(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> dict[str, torch.Tensor] | None:
+        pred = self._pad_to_model_dim(pred)
+        target = self._pad_to_model_dim(target)
+
+        p = pred[..., : self.REAL_DIM]
+        t = target[..., : self.REAL_DIM]
+
+        pred_grip = torch.sigmoid(p[..., self.GRIP_IDX]) * self.gripper_max
+        target_grip = t[..., self.GRIP_IDX]
+
+        pred_bin = pred_grip > self.gripper_thresh
+        target_bin = target_grip > self.gripper_thresh
+
+        return {
+            "target_zero_count": (~target_bin).sum(dtype=torch.int64).detach(),
+            "target_one_count": target_bin.sum(dtype=torch.int64).detach(),
+            "pred_zero_count": (~pred_bin).sum(dtype=torch.int64).detach(),
+            "pred_one_count": pred_bin.sum(dtype=torch.int64).detach(),
+            "true_negative_count": ((~pred_bin) & (~target_bin)).sum(dtype=torch.int64).detach(),
+            "true_positive_count": (pred_bin & target_bin).sum(dtype=torch.int64).detach(),
+            "false_positive_count": (pred_bin & (~target_bin)).sum(dtype=torch.int64).detach(),
+            "false_negative_count": ((~pred_bin) & target_bin).sum(dtype=torch.int64).detach(),
+        }
 
 
 # =============================================================================

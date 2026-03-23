@@ -24,6 +24,7 @@ import torch
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.datasets.factory import IMAGENET_STATS
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+from lerobot.policies.xvla.action_contract import build_slice_map, get_so101_slice_spec
 from lerobot.policies.xvla.utils import rotate6d_to_axis_angle
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
@@ -35,6 +36,7 @@ from lerobot.processor import (
     ProcessorStep,
     ProcessorStepRegistry,
     RenameObservationsProcessorStep,
+    SliceProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
 )
@@ -49,18 +51,13 @@ from lerobot.utils.constants import (
 )
 
 
-def make_xvla_pre_post_processors(
-    config: XVLAConfig,
-    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-) -> tuple[
-    PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    PolicyProcessorPipeline[PolicyAction, PolicyAction],
-]:
+def make_xvla_pre_post_processors(config: XVLAConfig, dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None) -> tuple[PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]:
     """
     Build the LeRobot processor pipelines for XVLA.
     """
 
     features = {**config.input_features, **config.output_features}
+    slice_spec = get_so101_slice_spec(getattr(config, "action_mode", None))
     
     # -------------------------------------------------------------------------
     # Bimanual / Gripper Identity Hack
@@ -68,33 +65,26 @@ def make_xvla_pre_post_processors(
     # normalization for that dimension. Otherwise, the BCE loss in the ActionSpace
     # will attempt to threshold normalized z-scores against physical 
     # degrees, which always fails and results in a 0.0 target.
+
+    # XVLA_THESIS
     # -------------------------------------------------------------------------
     if dataset_stats is not None:
         dataset_stats = deepcopy(dataset_stats)
-        action_mode = getattr(config, 'action_mode', None)
-        
-        grip_idx = None
-        if action_mode == 'so101_ee6d':
-            grip_idx = 9
-        elif action_mode == 'so101_joint':
-            grip_idx = 5
-            
-        if grip_idx is not None:
-            # Force identity (mean=0, std=1) on the gripper dimension for action and state
-            for feature in ["action", "observation.state"]:
-                if feature in dataset_stats:
-                    if "mean" in dataset_stats[feature] and len(dataset_stats[feature]["mean"]) > grip_idx:
-                        # Depending on the dataset_stats backend, these might be lists or tensors
-                        if isinstance(dataset_stats[feature]["mean"], torch.Tensor):
-                            dataset_stats[feature]["mean"][grip_idx] = 0.0
-                        else:
-                            dataset_stats[feature]["mean"][grip_idx] = 0.0
-                            
-                    if "std" in dataset_stats[feature] and len(dataset_stats[feature]["std"]) > grip_idx:
-                        if isinstance(dataset_stats[feature]["std"], torch.Tensor):
-                            dataset_stats[feature]["std"][grip_idx] = 1.0
-                        else:
-                            dataset_stats[feature]["std"][grip_idx] = 1.0
+        if slice_spec is not None and "action" in dataset_stats:
+            # Keep the gripper action channel in physical units so BCE targets and
+            # sigmoid-based postprocessing operate in the same space.
+            if "mean" in dataset_stats["action"] and len(dataset_stats["action"]["mean"]) > slice_spec.gripper_idx:
+                # Depending on the dataset_stats backend, these might be lists or tensors
+                if isinstance(dataset_stats["action"]["mean"], torch.Tensor):
+                    dataset_stats["action"]["mean"][slice_spec.gripper_idx] = 0.0
+                else:
+                    dataset_stats["action"]["mean"][slice_spec.gripper_idx] = 0.0
+
+            if "std" in dataset_stats["action"] and len(dataset_stats["action"]["std"]) > slice_spec.gripper_idx:
+                if isinstance(dataset_stats["action"]["std"], torch.Tensor):
+                    dataset_stats["action"]["std"][slice_spec.gripper_idx] = 1.0
+                else:
+                    dataset_stats["action"]["std"][slice_spec.gripper_idx] = 1.0
 
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
@@ -109,24 +99,18 @@ def make_xvla_pre_post_processors(
         XVLAImageNetNormalizeProcessorStep(),
         XVLAAddDomainIdProcessorStep(domain_id=config.domain_id),
         DeviceProcessorStep(device=config.device),
-        NormalizerProcessorStep(
-            features=features, norm_map=config.normalization_mapping, stats=dataset_stats
-        ),
     ]
+    if slice_spec is not None:
+        input_steps.append(SliceProcessorStep(slice_map=build_slice_map(slice_spec)))
+    input_steps.append(NormalizerProcessorStep(features=features, norm_map=config.normalization_mapping, stats=dataset_stats))
+    
     output_steps = [
-        UnnormalizerProcessorStep(
-            features=config.output_features,
-            norm_map=config.normalization_mapping,
-            stats=dataset_stats,
-        ),
+        UnnormalizerProcessorStep(features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats),
         DeviceProcessorStep(device="cpu"),
     ]
 
     return (
-        PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
-            steps=input_steps,
-            name=POLICY_PREPROCESSOR_DEFAULT_NAME,
-        ),
+        PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](steps=input_steps, name=POLICY_PREPROCESSOR_DEFAULT_NAME),
         PolicyProcessorPipeline[PolicyAction, PolicyAction](
             steps=output_steps,
             name=POLICY_POSTPROCESSOR_DEFAULT_NAME,

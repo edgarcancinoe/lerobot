@@ -18,6 +18,8 @@ import logging
 import warnings
 import os
 
+from lerobot.policies import xvla
+
 # Suppress Hugging Face transformers warnings related to Florence2 and GenerationMixin
 os.environ["ACCELERATE_LOG_LEVEL"] = "error"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
@@ -31,7 +33,6 @@ logging.getLogger("accelerate").setLevel(logging.ERROR)
 
 import time
 from contextlib import nullcontext
-from pprint import pformat
 from typing import Any
 
 import torch
@@ -48,6 +49,7 @@ from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.xvla.action_contract import get_so101_slice_spec, slice_dataset_meta_in_place
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
@@ -55,18 +57,9 @@ from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 import torchvision.utils as vutils
-from lerobot.utils.train_utils import (
-    get_step_checkpoint_dir,
-    get_step_identifier,
-    load_training_state,
-    save_checkpoint,
-    update_last_checkpoint,
-)
-from lerobot.utils.utils import (
-    format_big_number,
-    has_method,
-    init_logging,
-)
+from lerobot.utils.train_utils import get_step_checkpoint_dir, get_step_identifier, load_training_state, save_checkpoint, update_last_checkpoint
+from lerobot.utils.utils import format_big_number, has_method, init_logging
+
 def debug_batch(batch, tag="", step=0, only_step=0, slice_dim=None, dataset_meta=None):
     """Call this at any point in the pipeline to inspect tensors."""
     if step != only_step:
@@ -322,6 +315,59 @@ def save_debug_images(batch, output_dir, step=0, prefix="post"):
                 logging.warning(f"  Failed to save {out_path}: {e}")
     logging.info("")
 
+
+GRIPPER_DEBUG_COUNT_KEYS = (
+    "target_zero_count",
+    "target_one_count",
+    "pred_zero_count",
+    "pred_one_count",
+    "true_negative_count",
+    "true_positive_count",
+    "false_positive_count",
+    "false_negative_count",
+)
+
+
+@dataclasses.dataclass
+class GripperDebugWindow:
+    start_step: int
+    end_step: int = 0
+    counts: dict[str, int] = dataclasses.field(default_factory=lambda: {key: 0 for key in GRIPPER_DEBUG_COUNT_KEYS})
+
+    def update(self, step: int, count_dict: dict[str, Any]) -> None:
+        self.end_step = step
+        for key in GRIPPER_DEBUG_COUNT_KEYS:
+            value = count_dict[key]
+            if isinstance(value, torch.Tensor):
+                value = value.detach().item()
+            self.counts[key] += int(value)
+
+    def reset(self, next_start_step: int) -> None:
+        self.start_step = next_start_step
+        self.end_step = next_start_step - 1
+        self.counts = {key: 0 for key in GRIPPER_DEBUG_COUNT_KEYS}
+
+    def as_reduced_dict(self, accelerator: Accelerator) -> dict[str, float]:
+        device = accelerator.device
+        local_counts = torch.tensor([self.counts[key] for key in GRIPPER_DEBUG_COUNT_KEYS], device=device, dtype=torch.float32)
+        reduced_counts = accelerator.reduce(local_counts, reduction="sum")
+        reduced = {key: float(reduced_counts[idx].item()) for idx, key in enumerate(GRIPPER_DEBUG_COUNT_KEYS)}
+
+        tn = reduced["true_negative_count"]
+        tp = reduced["true_positive_count"]
+        fp = reduced["false_positive_count"]
+        fn = reduced["false_negative_count"]
+        total = tn + tp + fp + fn
+        class0_total = reduced["target_zero_count"]
+        class1_total = reduced["target_one_count"]
+
+        reduced["accuracy"] = (tn + tp) / total if total > 0 else 0.0
+        reduced["class0_accuracy"] = tn / class0_total if class0_total > 0 else 0.0
+        reduced["class1_accuracy"] = tp / class1_total if class1_total > 0 else 0.0
+        reduced["window_start_step"] = float(self.start_step)
+        reduced["window_end_step"] = float(self.end_step)
+        return reduced
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -493,46 +539,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     ##############################################################################################################
     ##############################################################################################################
-    # === CUSTOM DATA SLICING FOR ACTION AND STATE STRATEGIES ===
+    # === CUSTOM DATA SLICING FOR ACTION AND STATE STRATEGIES === VLA_THESIS
     ##############################################################################################################
     ##############################################################################################################
 
-    action_mode = getattr(cfg.policy, "action_mode", "").lower()
-    ACTION_DIM_SLICE_START = 0
-    ACTION_DIM_SLICE_END = None
-    if "ee6d" in action_mode:
-        ACTION_DIM_SLICE_END = 10  # EE6D slice
-    elif "joint" in action_mode:
-        ACTION_DIM_SLICE_START = 10
-        ACTION_DIM_SLICE_END = 16  # Joint slice
-    
-    # Slice action and state to match the policy's action space
-    if hasattr(dataset, "meta") and (ACTION_DIM_SLICE_START != 0 or ACTION_DIM_SLICE_END is not None):
-        for key in ["action", "observation.state"]:
-            if key in dataset.meta.features and "shape" in dataset.meta.features[key]:
-                feat_shape = dataset.meta.features[key]["shape"]
-                if isinstance(feat_shape, (list, tuple)) and len(feat_shape) > 0:
-                    old_shape = list(feat_shape)
-                    end = old_shape[-1] if ACTION_DIM_SLICE_END is None else min(old_shape[-1], ACTION_DIM_SLICE_END)
-                    old_shape[-1] = max(0, end - ACTION_DIM_SLICE_START)
-                    dataset.meta.features[key]["shape"] = tuple(old_shape)
-                elif isinstance(feat_shape, dict) and "shape" in feat_shape:
-                    old_shape = list(feat_shape["shape"])
-                    end = old_shape[-1] if ACTION_DIM_SLICE_END is None else min(old_shape[-1], ACTION_DIM_SLICE_END)
-                    old_shape[-1] = max(0, end - ACTION_DIM_SLICE_START)
-                    dataset.meta.features[key]["shape"] = tuple(old_shape)
-                
-            if key in dataset.meta.stats:
-                for stat_key in ["min", "max", "mean", "std"]:
-                    if stat_key in dataset.meta.stats[key]:
-                        end = len(dataset.meta.stats[key][stat_key]) if ACTION_DIM_SLICE_END is None else ACTION_DIM_SLICE_END
-                        dataset.meta.stats[key][stat_key] = dataset.meta.stats[key][stat_key][ACTION_DIM_SLICE_START:end]
+    xvla_slice_spec = None
+    if cfg.policy.type == "xvla":
+        xvla_slice_spec = get_so101_slice_spec(getattr(cfg.policy, "action_mode", ""))
 
-    if is_main_process and (ACTION_DIM_SLICE_START != 0 or ACTION_DIM_SLICE_END is not None):
-        logging.info(colored(f"\n--- DATA SLICING APPLIED ---", "yellow", attrs=["bold"]))
-        logging.info(colored(f"  > Detected Action Mode: {action_mode}", "cyan"))
-        end_str = str(ACTION_DIM_SLICE_END) if ACTION_DIM_SLICE_END is not None else "end"
-        logging.info(colored(f"  > Sliced 'action' & 'observation.state' dim bounds: [{ACTION_DIM_SLICE_START}:{end_str}]", "cyan"))
+    if hasattr(dataset, "meta") and xvla_slice_spec is not None:
+        slice_dataset_meta_in_place(dataset.meta, xvla_slice_spec)
+
+    if is_main_process and xvla_slice_spec is not None:
+        logging.info(colored("\n--- DATA SLICING APPLIED ---", "yellow", attrs=["bold"]))
+        logging.info(colored(f"  > Detected Action Mode: {xvla_slice_spec.action_mode}", "cyan"))
+        logging.info(colored(f"  > Sliced 'action' & 'observation.state' dim bounds: [{xvla_slice_spec.start}:{xvla_slice_spec.end}]", "cyan"))
+
+    ##############################################################################################################
+    ##############################################################################################################
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -580,7 +604,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if hasattr(policy, "model") and hasattr(policy.model, "action_space"):
             action_mode = getattr(cfg.policy, "action_mode", "N/A")
             dim_action = policy.model.dim_action
-            logging.info(colored(f"XVLA Action Configuration:", "cyan", attrs=["bold"]))
+            logging.info(colored("XVLA Action Configuration:", "cyan", attrs=["bold"]))
             logging.info(f"  > Action Mode: {action_mode}")
             logging.info(f"  > Expected Action Dim (Model): {dim_action}")
             
@@ -630,7 +654,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(colored("\n--- DATASET PIPELINE CONFIGURATION ---", "yellow", attrs=["bold"]))
         logging.info(f"  > Dataset Stat Keys: {', '.join(dataset.meta.stats.keys())}")
         logging.info(f"  > Input Features:    {', '.join(policy.config.input_features.keys())}")
-        logging.info(f"  > Norm Map:")
+        logging.info("  > Norm Map:")
         for k, v in policy.config.normalization_mapping.items():
             logging.info(f"      {k}: {v}")
 
@@ -640,29 +664,35 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **processor_kwargs,
         **postprocessor_kwargs,
     )
-                
-    if getattr(cfg.policy, "action_mode", "") != "" and "ACTION_DIM_SLICE_START" in locals():
+    
+    ####################################################################################################################
+    # VLA_THESIS: Insert SliceProcessorStep into preprocessor if xvla slicing is needed and not already present
+    ######################################################################################################################
+    if xvla_slice_spec is not None:
         from lerobot.processor.slice_processor import SliceProcessorStep
         from lerobot.processor.normalize_processor import NormalizerProcessorStep
         
         slice_map = {}
         if "action" in dataset.meta.features:
-            slice_map["action"] = (ACTION_DIM_SLICE_START, ACTION_DIM_SLICE_END)
+            slice_map["action"] = (xvla_slice_spec.start, xvla_slice_spec.end)
         if "observation.state" in dataset.meta.features:
-            slice_map["observation.state"] = (ACTION_DIM_SLICE_START, ACTION_DIM_SLICE_END)
+            slice_map["observation.state"] = (xvla_slice_spec.start, xvla_slice_spec.end)
             
         if slice_map:
-            slice_step = SliceProcessorStep(slice_map=slice_map)
+            has_slice_step = any(
+                isinstance(step_, SliceProcessorStep) and getattr(step_, "slice_map", None) == slice_map
+                for step_ in preprocessor.steps
+            )
             
-            # Insert before NormalizerProcessorStep (so we slice before normalizing)
-            insert_idx = len(preprocessor.steps)
-            for idx, step_ in enumerate(preprocessor.steps):
-                if isinstance(step_, NormalizerProcessorStep):
-                    insert_idx = idx
-                    break
-            
-            # HACK: Because the pipeline saves the class path if it can't find registry name
-            preprocessor.steps.insert(insert_idx, slice_step)
+            # MAKE SURE TO INSERT THE SLICE STEP BEFORE ANY NORMALIZATION STEP, so that the normalizer stats are computed on the sliced data
+            if not has_slice_step:
+                slice_step = SliceProcessorStep(slice_map=slice_map)
+                insert_idx = len(preprocessor.steps)
+                for idx, step_ in enumerate(preprocessor.steps):
+                    if isinstance(step_, NormalizerProcessorStep):
+                        insert_idx = idx
+                        break
+                preprocessor.steps.insert(insert_idx, slice_step)
 
     if is_main_process:
         logging.info(colored("\n--- PRE-POST PROCESSORS INITIALIZED ---", "cyan", attrs=["bold"]))
@@ -767,6 +797,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info(f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}")
 
+    gripper_debug_window = (
+        GripperDebugWindow(start_step=step + 1)
+        if getattr(accelerator.unwrap_model(policy), "config", None) is not None
+        and getattr(accelerator.unwrap_model(policy).config, "enable_gripper_debug_stats", False)
+        else None
+    )
+
     ##############################################################################################################
     ##############################################################################################################
     ######################################xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx########################################
@@ -797,14 +834,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         train_tracker.dataloading_s = time.perf_counter() - start_time
         train_tracker, output_dict = update_policy(train_tracker, policy, batch, optimizer, cfg.optimizer.grad_clip_norm, accelerator=accelerator, lr_scheduler=lr_scheduler, rabc_weights_provider=rabc_weights)
         
-        slice_dim = None
-        if "ACTION_DIM_SLICE_START" in locals():
-            if ACTION_DIM_SLICE_END is not None:
-                slice_dim = ACTION_DIM_SLICE_END - ACTION_DIM_SLICE_START
-            elif "action" in dataset.meta.features:
-                slice_dim = dataset.meta.features["action"].shape[-1] - ACTION_DIM_SLICE_START
+        slice_dim = xvla_slice_spec.real_dim if xvla_slice_spec is not None else None
 
         debug_batch(output_dict, tag="MODEL OUTPUT dict", step=step, slice_dim=slice_dim, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
+        gripper_debug_counts = output_dict.pop("gripper_debug_counts", None)
 
         ##############################################################################################################
         ##############################################################################################################
@@ -817,8 +850,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         step += 1
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
+        should_log_gripper_window = gripper_debug_window is not None and (
+            (cfg.log_freq > 0 and step % cfg.log_freq == 0) or step == cfg.steps
+        )
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+
+        if gripper_debug_window is not None and gripper_debug_counts is not None:
+            gripper_debug_window.update(step=step, count_dict=gripper_debug_counts)
 
         if is_log_step:
             logging.info(train_tracker)
@@ -838,6 +877,49 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     )
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+
+        if should_log_gripper_window:
+            gripper_window_dict = gripper_debug_window.as_reduced_dict(accelerator)
+            if is_main_process:
+                window_start = int(gripper_window_dict["window_start_step"])
+                window_end = int(gripper_window_dict["window_end_step"])
+                logging.info(
+                    "gripper window %d-%d target0=%.0f target1=%.0f pred0=%.0f pred1=%.0f "
+                    "tn=%.0f tp=%.0f fp=%.0f fn=%.0f acc=%.4f class0_acc=%.4f class1_acc=%.4f",
+                    window_start,
+                    window_end,
+                    gripper_window_dict["target_zero_count"],
+                    gripper_window_dict["target_one_count"],
+                    gripper_window_dict["pred_zero_count"],
+                    gripper_window_dict["pred_one_count"],
+                    gripper_window_dict["true_negative_count"],
+                    gripper_window_dict["true_positive_count"],
+                    gripper_window_dict["false_positive_count"],
+                    gripper_window_dict["false_negative_count"],
+                    gripper_window_dict["accuracy"],
+                    gripper_window_dict["class0_accuracy"],
+                    gripper_window_dict["class1_accuracy"],
+                )
+                if wandb_logger:
+                    wandb_logger.log_dict(
+                        {
+                            "gripper/window_start_step": window_start,
+                            "gripper/window_end_step": window_end,
+                            "gripper/target_zero_count": gripper_window_dict["target_zero_count"],
+                            "gripper/target_one_count": gripper_window_dict["target_one_count"],
+                            "gripper/pred_zero_count": gripper_window_dict["pred_zero_count"],
+                            "gripper/pred_one_count": gripper_window_dict["pred_one_count"],
+                            "gripper/tn": gripper_window_dict["true_negative_count"],
+                            "gripper/tp": gripper_window_dict["true_positive_count"],
+                            "gripper/fp": gripper_window_dict["false_positive_count"],
+                            "gripper/fn": gripper_window_dict["false_negative_count"],
+                            "gripper/accuracy": gripper_window_dict["accuracy"],
+                            "gripper/class0_accuracy": gripper_window_dict["class0_accuracy"],
+                            "gripper/class1_accuracy": gripper_window_dict["class1_accuracy"],
+                        },
+                        step,
+                    )
+            gripper_debug_window.reset(next_start_step=step + 1)
 
         ##############################################################################################################
         ##############################################################################################################

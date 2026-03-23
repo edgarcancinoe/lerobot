@@ -90,7 +90,8 @@ class XVLAConfig(PreTrainedConfig):
     
     # Gripper processing parameters
     gripper_open_threshold: float = 12.0  # Values > threshold will be targeted as 1.0 (open)
-    gripper_max_value: float = 24.0       # Open (1.0) predictions will be scaled to this value during inference
+    gripper_max_value: float = 28.0       # Open (1.0) predictions will be scaled to this value during inference
+    enable_gripper_debug_stats: bool = False  # Log windowed gripper class/correctness diagnostics during training
 
     # Vision preprocessing
     resize_imgs_with_padding: tuple[int, int] | None = None
