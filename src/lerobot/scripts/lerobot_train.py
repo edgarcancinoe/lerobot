@@ -199,6 +199,32 @@ def _validate_xvla_sequence_budget(policy, dataset, preprocessor) -> None:
     )
 
 
+def _patch_xvla_gripper_stats_for_overrides(policy_cfg, dataset_stats):
+    if policy_cfg.type != "xvla" or not dataset_stats:
+        return dataset_stats
+
+    slice_spec = get_so101_slice_spec(getattr(policy_cfg, "action_mode", ""))
+    if slice_spec is None or "action" not in dataset_stats:
+        return dataset_stats
+
+    patched_stats = {}
+    for key, value in dataset_stats.items():
+        if isinstance(value, dict):
+            patched_stats[key] = {
+                stat_name: stat_value.clone() if isinstance(stat_value, torch.Tensor) else deepcopy(stat_value)
+                for stat_name, stat_value in value.items()
+            }
+        else:
+            patched_stats[key] = deepcopy(value)
+
+    action_stats = patched_stats["action"]
+    for stat_name, target_value in (("mean", 0.0), ("std", 1.0)):
+        if stat_name in action_stats and len(action_stats[stat_name]) > slice_spec.gripper_idx:
+            action_stats[stat_name][slice_spec.gripper_idx] = target_value
+
+    return patched_stats
+
+
 def debug_batch(batch, tag="", step=0, only_step=0, slice_dim=None, dataset_meta=None):
     """Call this at any point in the pipeline to inspect tensors."""
     if step != only_step:
@@ -779,11 +805,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         processor_kwargs["dataset_meta"] = dataset.meta
 
     if cfg.policy.pretrained_path is not None:
+        processor_stats = _patch_xvla_gripper_stats_for_overrides(cfg.policy, dataset.meta.stats)
         # Preprocessor
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": processor_stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
             },
@@ -796,7 +823,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # Postprocesor
         postprocessor_kwargs["postprocessor_overrides"] = {
             "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
+                "stats": processor_stats,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,
             },
