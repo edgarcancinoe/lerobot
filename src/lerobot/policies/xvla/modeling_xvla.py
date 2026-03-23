@@ -435,6 +435,44 @@ class XVLAPolicy(PreTrainedPolicy):
 
         return self._queues[ACTION].popleft()
 
+    @staticmethod
+    def _resize_positional_embedding_if_needed(
+        state_dict: dict[str, Tensor],
+        expected_pos_emb: Tensor,
+    ) -> None:
+        pos_emb_key = "model.transformer.pos_emb"
+        if pos_emb_key not in state_dict:
+            return
+
+        loaded_pos_emb = state_dict[pos_emb_key]
+        if loaded_pos_emb.shape == expected_pos_emb.shape:
+            return
+
+        if loaded_pos_emb.ndim != expected_pos_emb.ndim or loaded_pos_emb.shape[0] != expected_pos_emb.shape[0]:
+            raise ValueError(
+                "Unexpected positional embedding rank/leading dimensions while loading XVLA checkpoint: "
+                f"checkpoint={tuple(loaded_pos_emb.shape)}, expected={tuple(expected_pos_emb.shape)}."
+            )
+        if loaded_pos_emb.shape[-1] != expected_pos_emb.shape[-1]:
+            raise ValueError(
+                "Unexpected positional embedding hidden size while loading XVLA checkpoint: "
+                f"checkpoint={tuple(loaded_pos_emb.shape)}, expected={tuple(expected_pos_emb.shape)}."
+            )
+
+        resized_pos_emb = expected_pos_emb.detach().clone()
+        copy_len = min(loaded_pos_emb.shape[1], expected_pos_emb.shape[1])
+        resized_pos_emb[:, :copy_len, :] = loaded_pos_emb[:, :copy_len, :].to(
+            device=resized_pos_emb.device,
+            dtype=resized_pos_emb.dtype,
+        )
+        state_dict[pos_emb_key] = resized_pos_emb
+
+        logging.info(
+            "Resized XVLA transformer positional embedding from %s to %s while loading checkpoint.",
+            tuple(loaded_pos_emb.shape),
+            tuple(expected_pos_emb.shape),
+        )
+
     @classmethod
     def from_pretrained(
         cls: builtins.type[T],
@@ -506,6 +544,7 @@ class XVLAPolicy(PreTrainedPolicy):
         if encoder_key in state_dict:
             state_dict[shared_key] = state_dict[encoder_key]
             # or deepcopy
+        cls._resize_positional_embedding_if_needed(state_dict, instance.model.transformer.pos_emb)
         # step 4: load into instance
         instance.load_state_dict(state_dict, strict=True)
         logging.info("Loaded XVLA checkpoint")

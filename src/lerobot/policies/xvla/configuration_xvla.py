@@ -149,7 +149,6 @@ class XVLAConfig(PreTrainedConfig):
         return self._florence_config_obj
 
     def validate_features(self) -> None:
-        print(f"[DEBUG-FINAL] Validating... empty_cameras={self.empty_cameras}, num_image_views={self.num_image_views}, image_features len={len(self.image_features)}")
         if self.empty_cameras > 0:
             height, width = (480, 640)
             if self.resize_imgs_with_padding is not None:
@@ -164,8 +163,11 @@ class XVLAConfig(PreTrainedConfig):
 
         if self.num_image_views is None:
             self.num_image_views = len(self.image_features)
-        else:
-            self.num_image_views = max(self.num_image_views, len(self.image_features))
+        elif self.num_image_views < len(self.image_features):
+            raise ValueError(
+                f"`num_image_views` ({self.num_image_views}) is smaller than the configured visual schema "
+                f"({len(self.image_features)} visual features: {list(self.image_features.keys())})."
+            )
 
     def get_optimizer_preset(self) -> XVLAAdamWConfig:
         """Return the XVLA-specific optimizer with differential learning rates.

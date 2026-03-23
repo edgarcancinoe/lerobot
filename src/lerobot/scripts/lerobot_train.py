@@ -39,12 +39,13 @@ import torch
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
+from torch.utils.data._utils.collate import default_collate
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.datasets.utils import cycle
+from lerobot.datasets.utils import cycle, dataset_to_policy_features
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -53,12 +54,150 @@ from lerobot.policies.xvla.action_contract import get_so101_slice_spec, slice_da
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.scripts.lerobot_eval import eval_policy_all
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 import torchvision.utils as vutils
 from lerobot.utils.train_utils import get_step_checkpoint_dir, get_step_identifier, load_training_state, save_checkpoint, update_last_checkpoint
 from lerobot.utils.utils import format_big_number, has_method, init_logging
+from lerobot.utils.constants import OBS_IMAGES
+
+XVLA_EXPECTED_TOKENIZER_MAX_LENGTH = 64
+XVLA_EXPECTED_NUM_IMAGE_VIEWS = 3
+XVLA_EXPECTED_EMPTY_CAMERAS = 1
+XVLA_EXPECTED_MAX_LEN_SEQ = 1024
+XVLA_EXPECTED_IMAGE_KEYS = (
+    f"{OBS_IMAGES}.image",
+    f"{OBS_IMAGES}.image2",
+    f"{OBS_IMAGES}.empty_camera_0",
+)
+
+
+def _rename_policy_feature_key(key: str, rename_map: dict[str, str] | None) -> str:
+    if not rename_map:
+        return key
+    return rename_map.get(key, key)
+
+
+def _enforce_xvla_finetune_contract(policy_cfg) -> None:
+    policy_cfg.tokenizer_max_length = XVLA_EXPECTED_TOKENIZER_MAX_LENGTH
+    policy_cfg.num_image_views = XVLA_EXPECTED_NUM_IMAGE_VIEWS
+    policy_cfg.empty_cameras = XVLA_EXPECTED_EMPTY_CAMERAS
+    policy_cfg.max_len_seq = XVLA_EXPECTED_MAX_LEN_SEQ
+
+
+def _rebuild_xvla_visual_input_features(policy_cfg, dataset_meta, rename_map: dict[str, str] | None) -> None:
+    dataset_policy_features = dataset_to_policy_features(dataset_meta.features)
+    renamed_visual_features: dict[str, PolicyFeature] = {}
+    for key, feature in dataset_policy_features.items():
+        if feature.type is not FeatureType.VISUAL:
+            continue
+        renamed_key = _rename_policy_feature_key(key, rename_map)
+        renamed_visual_features[renamed_key] = PolicyFeature(type=FeatureType.VISUAL, shape=feature.shape)
+
+    expected_real_views = policy_cfg.num_image_views - policy_cfg.empty_cameras
+    if len(renamed_visual_features) != expected_real_views:
+        raise ValueError(
+            "XVLA finetuning expects exactly "
+            f"{expected_real_views} real camera views after rename-map application, but found "
+            f"{len(renamed_visual_features)} visual inputs: {list(renamed_visual_features.keys())}."
+        )
+
+    non_visual_features = {
+        key: feature
+        for key, feature in policy_cfg.input_features.items()
+        if feature.type is not FeatureType.VISUAL
+    }
+
+    rebuilt_input_features: dict[str, PolicyFeature] = dict(non_visual_features)
+    rebuilt_input_features.update(renamed_visual_features)
+
+    if policy_cfg.resize_imgs_with_padding is not None:
+        height, width = policy_cfg.resize_imgs_with_padding
+        empty_shape = (3, height, width)
+    else:
+        first_visual_shape = next(iter(renamed_visual_features.values())).shape
+        empty_shape = first_visual_shape
+
+    for idx in range(policy_cfg.empty_cameras):
+        rebuilt_input_features[f"{OBS_IMAGES}.empty_camera_{idx}"] = PolicyFeature(
+            type=FeatureType.VISUAL,
+            shape=empty_shape,
+        )
+
+    policy_cfg.input_features = rebuilt_input_features
+
+
+def _assert_xvla_finetune_contract(policy_cfg) -> None:
+    actual_image_keys = tuple(policy_cfg.image_features.keys())
+    if policy_cfg.tokenizer_max_length != XVLA_EXPECTED_TOKENIZER_MAX_LENGTH:
+        raise ValueError(
+            f"XVLA checkpoint config drifted: tokenizer_max_length={policy_cfg.tokenizer_max_length}, "
+            f"expected {XVLA_EXPECTED_TOKENIZER_MAX_LENGTH}."
+        )
+    if policy_cfg.num_image_views != XVLA_EXPECTED_NUM_IMAGE_VIEWS:
+        raise ValueError(
+            f"XVLA checkpoint config drifted: num_image_views={policy_cfg.num_image_views}, "
+            f"expected {XVLA_EXPECTED_NUM_IMAGE_VIEWS}."
+        )
+    if policy_cfg.empty_cameras != XVLA_EXPECTED_EMPTY_CAMERAS:
+        raise ValueError(
+            f"XVLA checkpoint config drifted: empty_cameras={policy_cfg.empty_cameras}, "
+            f"expected {XVLA_EXPECTED_EMPTY_CAMERAS}."
+        )
+    if policy_cfg.max_len_seq != XVLA_EXPECTED_MAX_LEN_SEQ:
+        raise ValueError(
+            f"XVLA checkpoint config drifted: max_len_seq={policy_cfg.max_len_seq}, "
+            f"expected {XVLA_EXPECTED_MAX_LEN_SEQ}."
+        )
+    if actual_image_keys != XVLA_EXPECTED_IMAGE_KEYS:
+        raise ValueError(
+            f"XVLA visual schema drifted: actual={list(actual_image_keys)}, "
+            f"expected={list(XVLA_EXPECTED_IMAGE_KEYS)}."
+        )
+
+
+def _validate_xvla_sequence_budget(policy, dataset, preprocessor) -> None:
+    sample_batch = default_collate([dataset[0]])
+    processed_batch = preprocessor(sample_batch)
+
+    with torch.no_grad():
+        inputs = policy._build_model_inputs(processed_batch)
+        enc = policy.model.forward_vlm(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["image_input"],
+            image_mask=inputs["image_mask"],
+        )
+
+    seq_len = (
+        policy.config.chunk_size
+        + enc["vlm_features"].shape[1]
+        + enc["aux_visual_inputs"].shape[1]
+    )
+    max_len_seq = policy.model.transformer.pos_emb.shape[1]
+    if seq_len > max_len_seq:
+        raise ValueError(
+            "XVLA multimodal sequence exceeds the configured transformer budget. "
+            f"image_keys={list(policy.config.image_features.keys())}, "
+            f"total_views={policy.config.num_image_views}, "
+            f"tokenizer_max_length={policy.config.tokenizer_max_length}, "
+            f"chunk_size={policy.config.chunk_size}, "
+            f"max_len_seq={policy.config.max_len_seq}, "
+            f"measured_seq_len={seq_len}."
+        )
+
+    logging.info(
+        "XVLA sequence budget validated: image_keys=%s total_views=%s tokenizer_max_length=%s "
+        "chunk_size=%s measured_seq_len=%s max_len_seq=%s",
+        list(policy.config.image_features.keys()),
+        policy.config.num_image_views,
+        policy.config.tokenizer_max_length,
+        policy.config.chunk_size,
+        seq_len,
+        max_len_seq,
+    )
+
 
 def debug_batch(batch, tag="", step=0, only_step=0, slice_dim=None, dataset_meta=None):
     """Call this at any point in the pipeline to inspect tensors."""
@@ -550,6 +689,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if hasattr(dataset, "meta") and xvla_slice_spec is not None:
         slice_dataset_meta_in_place(dataset.meta, xvla_slice_spec)
 
+    if cfg.policy.type == "xvla":
+        _enforce_xvla_finetune_contract(cfg.policy)
+        _rebuild_xvla_visual_input_features(cfg.policy, dataset.meta, cfg.rename_map)
+
     if is_main_process and xvla_slice_spec is not None:
         logging.info(colored("\n--- DATA SLICING APPLIED ---", "yellow", attrs=["bold"]))
         logging.info(colored(f"  > Detected Action Mode: {xvla_slice_spec.action_mode}", "cyan"))
@@ -580,6 +723,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(colored("\n--- POLICY CONFIGURATION ---", "yellow", attrs=["bold"]))
         logging.info(f"  > Input Features:  {', '.join(policy.config.input_features.keys())}")
         logging.info(f"  > Output Features: {', '.join(policy.config.output_features.keys())}")
+        if cfg.policy.type == "xvla":
+            logging.info(
+                "  > XVLA Finetune Contract: tokenizer_max_length=%s num_image_views=%s empty_cameras=%s max_len_seq=%s",
+                policy.config.tokenizer_max_length,
+                policy.config.num_image_views,
+                policy.config.empty_cameras,
+                policy.config.max_len_seq,
+            )
         logging.info(colored("  > Norm Mapping (embedded in every saved config.json):", "green"))
         for k, v in policy.config.normalization_mapping.items():
             logging.info(colored(f"      {k}: {v}", "green"))
@@ -715,6 +866,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             for src, dst in cfg.rename_map.items():
                 if "image" in src or "image" in dst:
                     logging.info(f"    [MAPPING] {src}  --->  {dst}")
+
+    if cfg.policy.type == "xvla":
+        _assert_xvla_finetune_contract(policy.config)
+        _validate_xvla_sequence_budget(policy, dataset, preprocessor)
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
@@ -931,6 +1086,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                if cfg.policy.type == "xvla":
+                    _assert_xvla_finetune_contract(accelerator.unwrap_model(policy).config)
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,
                     step=step,
@@ -964,6 +1121,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 cfg.policy.repo_id = f"{original_repo_id}-step-{step}"
 
                 unwrapped_policy = accelerator.unwrap_model(policy)
+                if cfg.policy.type == "xvla":
+                    _assert_xvla_finetune_contract(unwrapped_policy.config)
                 
                 # Push the files to the repo in a single commit by saving to a local tmp dir
                 from tempfile import TemporaryDirectory
@@ -1046,6 +1205,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if cfg.policy.push_to_hub:
             unwrapped_policy = accelerator.unwrap_model(policy)
+            if cfg.policy.type == "xvla":
+                _assert_xvla_finetune_contract(unwrapped_policy.config)
             norm_map_str = ", ".join(f"{k}={v}" for k, v in unwrapped_policy.config.normalization_mapping.items())
             logging.info(colored(f"Final push — saving config.json with normalization_mapping: [{norm_map_str}]", "green"))
             if cfg.policy.use_peft:
