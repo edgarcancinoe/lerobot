@@ -780,6 +780,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if cfg.policy.pretrained_path is not None:
         # Preprocessor
+        print(dataset.meta.stats)
+        import time
+        time.sleep(60)
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
