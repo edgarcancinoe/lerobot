@@ -778,10 +778,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         if is_main_process:
             logging.info("✓ Custom image augmenter transferred to GPU (batched mode enabled)")
 
+    action_mode = getattr(cfg.policy, "action_mode", "N/A")
+
     if is_main_process:
         # Debugging for xVLA action mode and dimensions
         if hasattr(policy, "model") and hasattr(policy.model, "action_space"):
-            action_mode = getattr(cfg.policy, "action_mode", "N/A")
             dim_action = policy.model.dim_action
             logging.info(colored("XVLA Action Configuration:", "cyan", attrs=["bold"]))
             logging.info(f"  > Action Mode: {action_mode}")
@@ -830,13 +831,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "norm_map": policy.config.normalization_mapping,
             },
         }
-
-        logging.info(colored("\n--- PreProcessor overrides ---", "yellow", attrs=["bold"]))
-        if action_mode == 'so101_ee6d':
-            print(processor_kwargs["preprocessor_overrides"]['normalizer_processor']['stats']['observation.state'])
-            print(processor_kwargs["preprocessor_overrides"]['normalizer_processor']['stats']['action'])
-            logging.info(colored("\n--- PostProcessor overrides ---", "yellow", attrs=["bold"]))
-            print(postprocessor_kwargs["postprocessor_overrides"]['unnormalizer_processor'])
 
 
     if is_main_process:
