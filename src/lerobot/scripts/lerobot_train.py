@@ -807,6 +807,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.policy.pretrained_path is not None:
         processor_stats = _patch_xvla_gripper_stats_for_overrides(cfg.policy, dataset.meta.stats)
         # Preprocessor
+        print(dataset.meta.stats)
+        import time
+        time.sleep(60)
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {

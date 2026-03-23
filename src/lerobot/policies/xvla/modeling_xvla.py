@@ -218,13 +218,13 @@ class XVLAModel(nn.Module):
         ) % (1 - 1e-5)
 
         action_noisy = torch.randn_like(action) * t.view(-1, 1, 1) + action * (1 - t).view(-1, 1, 1)
-        print("============================================")
-        print(f"Proprioceptive info raw: {proprio}")
-        print("============================================")
+        # print("============================================")
+        # print(f"Proprioceptive info raw: {proprio}")
+        # print("============================================")
         proprio_m, action_noisy_m = self.action_space.preprocess(proprio, action_noisy)
-        print("============================================")
-        print(f"Proprioceptive info processed for transformer inference: {proprio_m}")
-        print("============================================")
+        # print("============================================")
+        # print(f"Proprioceptive info processed for transformer inference: {proprio_m}")
+        # print("============================================")
 
         # SEEMS LIKE THEY ARE NOT USING THE GRIPPER ANYWHERE HERE. Basically gripper behavior relies
         # only on VLM output. I REPLICATE THIS BEHAVIOR. 
