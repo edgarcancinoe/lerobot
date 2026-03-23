@@ -200,6 +200,8 @@ def _validate_xvla_sequence_budget(policy, dataset, preprocessor) -> None:
 
 
 def _patch_xvla_gripper_stats_for_overrides(policy_cfg, dataset_stats):
+    from copy import deepcopy
+
     if policy_cfg.type != "xvla" or not dataset_stats:
         return dataset_stats
 
@@ -807,9 +809,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if cfg.policy.pretrained_path is not None:
         processor_stats = _patch_xvla_gripper_stats_for_overrides(cfg.policy, dataset.meta.stats)
         # Preprocessor
-        print(dataset.meta.stats)
-        import time
-        time.sleep(60)
         processor_kwargs["preprocessor_overrides"] = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
