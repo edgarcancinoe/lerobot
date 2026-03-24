@@ -40,6 +40,7 @@ from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
 from torch.utils.data._utils.collate import default_collate
+from tqdm.auto import tqdm
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -72,6 +73,46 @@ XVLA_EXPECTED_IMAGE_KEYS = (
     f"{OBS_IMAGES}.image2",
     f"{OBS_IMAGES}.empty_camera_0",
 )
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "?"
+
+    total_seconds = max(0, int(round(seconds)))
+    days, remainder = divmod(total_seconds, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if days > 0:
+        return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _build_training_progress_postfix(
+    step: int,
+    total_steps: int,
+    elapsed_s: float,
+    start_step: int,
+    loss: float | None = None,
+) -> dict[str, str]:
+    completed_steps = max(step - start_step, 0)
+    avg_step_s = (elapsed_s / completed_steps) if completed_steps > 0 else None
+    remaining_steps = max(total_steps - step, 0)
+    remaining_s = (avg_step_s * remaining_steps) if avg_step_s is not None else None
+    completion_ts = (time.time() + remaining_s) if remaining_s is not None else None
+
+    postfix = {
+        "avg_step": _format_duration(avg_step_s),
+        "remaining": _format_duration(remaining_s),
+        "done_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(completion_ts)) if completion_ts else "?",
+    }
+    if loss is not None:
+        postfix["loss"] = f"{loss:.4f}"
+
+    return postfix
 
 
 def _rename_policy_feature_key(key: str, rename_map: dict[str, str] | None) -> str:
@@ -759,9 +800,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 policy.config.empty_cameras,
                 policy.config.max_len_seq,
             )
-        logging.info(colored("  > Norm Mapping (embedded in every saved config.json):", "green"))
-        for k, v in policy.config.normalization_mapping.items():
-            logging.info(colored(f"      {k}: {v}", "green"))
+        # logging.info(colored("  > Norm Mapping (embedded in every saved config.json):", "green"))
+        # for k, v in policy.config.normalization_mapping.items():
+        #     logging.info(colored(f"      {k}: {v}", "green"))
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")
@@ -837,9 +878,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(colored("\n--- DATASET PIPELINE CONFIGURATION ---", "yellow", attrs=["bold"]))
         logging.info(f"  > Dataset Stat Keys: {', '.join(dataset.meta.stats.keys())}")
         logging.info(f"  > Input Features:    {', '.join(policy.config.input_features.keys())}")
-        logging.info("  > Norm Map:")
-        for k, v in policy.config.normalization_mapping.items():
-            logging.info(f"      {k}: {v}")
+        # logging.info("  > Norm Map:")
+        # for k, v in policy.config.normalization_mapping.items():
+        #     logging.info(f"      {k}: {v}")
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -884,13 +925,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         for s in preprocessor.steps:
             logging.info(f"      - {type(s).__name__}")
             # if type(s).__name__ == "NormalizerProcessorStep":
-            log_processor_stats(s, dataset.meta)
+            # log_processor_stats(s, dataset.meta)
                 
         logging.info("  > Postprocessor steps:")
         for s in postprocessor.steps:
             logging.info(f"      - {type(s).__name__}")
             # if type(s).__name__ == "UnnormalizerProcessorStep":
-            log_processor_stats(s, dataset.meta)
+            # log_processor_stats(s, dataset.meta)
 
         # Log Rename Map details
         if cfg.rename_map:
@@ -1001,236 +1042,258 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     ##############################################################################################################
     ##############################################################################################################
 
+    progress_refresh_freq = cfg.log_freq if cfg.log_freq > 0 else 1
+    progress_start_step = step
+    progress_start_time = time.time()
+    progress_bar = (tqdm(total=cfg.steps, initial=step, desc="Training", dynamic_ncols=True, leave=True) if is_main_process else nullcontext())
+
     print("-------------------------------------------------------------------------------------------------------")
     print("Starting Training Loop")
     print("-------------------------------------------------------------------------------------------------------")
-    for _ in range(step, cfg.steps):
+    with progress_bar as training_progress_bar:
+        for _ in range(step, cfg.steps):
 
-        start_time = time.perf_counter()
-        raw_batch = next(dl_iter)
+            start_time = time.perf_counter()
+            raw_batch = next(dl_iter)
 
-        # PRE PROCESSING
-        debug_batch(raw_batch, tag="RAW (before preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
-        # if is_main_process:
-        #     # Happens only on step 0
-        #     save_debug_images(batch, cfg.output_dir, step=0, prefix="raw")
-   
-        batch = preprocessor(raw_batch)
-        debug_batch(batch, tag="POST (after preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
-        # if is_main_process:
-        #     save_debug_images(batch, cfg.output_dir, step=0, prefix="post")
+            # PRE PROCESSING
+            debug_batch(raw_batch, tag="RAW (before preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
+            # if is_main_process:
+            #     # Happens only on step 0
+            #     save_debug_images(batch, cfg.output_dir, step=0, prefix="raw")
+    
+            batch = preprocessor(raw_batch)
+            debug_batch(batch, tag="POST (after preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
+            # if is_main_process:
+            #     save_debug_images(batch, cfg.output_dir, step=0, prefix="post")
 
-        # Use data
-        train_tracker.dataloading_s = time.perf_counter() - start_time
-        train_tracker, output_dict = update_policy(train_tracker, policy, batch, optimizer, cfg.optimizer.grad_clip_norm, accelerator=accelerator, lr_scheduler=lr_scheduler, rabc_weights_provider=rabc_weights)
-        
-        slice_dim = xvla_slice_spec.real_dim if xvla_slice_spec is not None else None
+            # Use data
+            train_tracker.dataloading_s = time.perf_counter() - start_time
+            train_tracker, output_dict = update_policy(train_tracker, policy, batch, optimizer, cfg.optimizer.grad_clip_norm, accelerator=accelerator, lr_scheduler=lr_scheduler, rabc_weights_provider=rabc_weights)
+            
+            slice_dim = xvla_slice_spec.real_dim if xvla_slice_spec is not None else None
 
-        debug_batch(output_dict, tag="MODEL OUTPUT dict", step=step, slice_dim=slice_dim, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
-        gripper_debug_counts = output_dict.pop("gripper_debug_counts", None)
+            debug_batch(output_dict, tag="MODEL OUTPUT dict", step=step, slice_dim=slice_dim, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
+            gripper_debug_counts = output_dict.pop("gripper_debug_counts", None)
 
-        ##############################################################################################################
-        ##############################################################################################################
-        # LOGS AND STUFF
-        ##############################################################################################################
-        ##############################################################################################################
+            ##############################################################################################################
+            ##############################################################################################################
+            # LOGS AND STUFF
+            ##############################################################################################################
+            ##############################################################################################################
 
-        # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
-        # increment `step` here.
-        step += 1
-        train_tracker.step()
-        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
-        should_log_gripper_window = gripper_debug_window is not None and (
-            (cfg.log_freq > 0 and step % cfg.log_freq == 0) or step == cfg.steps
-        )
-        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
-        is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+            # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+            # increment `step` here.
+            step += 1
+            train_tracker.step()
+            is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
+            should_log_gripper_window = gripper_debug_window is not None and (
+                (cfg.log_freq > 0 and step % cfg.log_freq == 0) or step == cfg.steps
+            )
+            is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+            is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
-        if gripper_debug_window is not None and gripper_debug_counts is not None:
-            gripper_debug_window.update(step=step, count_dict=gripper_debug_counts)
-
-        if is_log_step:
-            logging.info(train_tracker)
-            if wandb_logger:
-                wandb_log_dict = train_tracker.to_dict()
-                if output_dict:
-                    wandb_log_dict.update(output_dict)
-                # Log RA-BC statistics if enabled
-                if rabc_weights is not None:
-                    rabc_stats = rabc_weights.get_stats()
-                    wandb_log_dict.update(
-                        {
-                            "rabc_delta_mean": rabc_stats["delta_mean"],
-                            "rabc_delta_std": rabc_stats["delta_std"],
-                            "rabc_num_frames": rabc_stats["num_frames"],
-                        }
+            if training_progress_bar is not None:
+                training_progress_bar.update(1)
+                should_refresh_progress = step % progress_refresh_freq == 0 or step == cfg.steps
+                if should_refresh_progress:
+                    loss_value = train_tracker.loss.val if train_tracker.loss.count > 0 else None
+                    training_progress_bar.set_postfix(
+                        _build_training_progress_postfix(
+                            step=step,
+                            total_steps=cfg.steps,
+                            elapsed_s=time.time() - progress_start_time,
+                            start_step=progress_start_step,
+                            loss=loss_value,
+                        ),
+                        refresh=True,
                     )
-                wandb_logger.log_dict(wandb_log_dict, step)
-            train_tracker.reset_averages()
 
-        if should_log_gripper_window:
-            gripper_window_dict = gripper_debug_window.as_reduced_dict(accelerator)
-            if is_main_process:
-                window_start = int(gripper_window_dict["window_start_step"])
-                window_end = int(gripper_window_dict["window_end_step"])
-                logging.info(
-                    "gripper window %d-%d target0=%.0f target1=%.0f pred0=%.0f pred1=%.0f "
-                    "tn=%.0f tp=%.0f fp=%.0f fn=%.0f acc=%.4f class0_acc=%.4f class1_acc=%.4f",
-                    window_start,
-                    window_end,
-                    gripper_window_dict["target_zero_count"],
-                    gripper_window_dict["target_one_count"],
-                    gripper_window_dict["pred_zero_count"],
-                    gripper_window_dict["pred_one_count"],
-                    gripper_window_dict["true_negative_count"],
-                    gripper_window_dict["true_positive_count"],
-                    gripper_window_dict["false_positive_count"],
-                    gripper_window_dict["false_negative_count"],
-                    gripper_window_dict["accuracy"],
-                    gripper_window_dict["class0_accuracy"],
-                    gripper_window_dict["class1_accuracy"],
-                )
+            if gripper_debug_window is not None and gripper_debug_counts is not None:
+                gripper_debug_window.update(step=step, count_dict=gripper_debug_counts)
+
+            if is_log_step:
+                logging.info(train_tracker)
                 if wandb_logger:
-                    wandb_logger.log_dict(
-                        {
-                            "gripper/window_start_step": window_start,
-                            "gripper/window_end_step": window_end,
-                            "gripper/target_zero_count": gripper_window_dict["target_zero_count"],
-                            "gripper/target_one_count": gripper_window_dict["target_one_count"],
-                            "gripper/pred_zero_count": gripper_window_dict["pred_zero_count"],
-                            "gripper/pred_one_count": gripper_window_dict["pred_one_count"],
-                            "gripper/tn": gripper_window_dict["true_negative_count"],
-                            "gripper/tp": gripper_window_dict["true_positive_count"],
-                            "gripper/fp": gripper_window_dict["false_positive_count"],
-                            "gripper/fn": gripper_window_dict["false_negative_count"],
-                            "gripper/accuracy": gripper_window_dict["accuracy"],
-                            "gripper/class0_accuracy": gripper_window_dict["class0_accuracy"],
-                            "gripper/class1_accuracy": gripper_window_dict["class1_accuracy"],
-                        },
-                        step,
+                    wandb_log_dict = train_tracker.to_dict()
+                    if output_dict:
+                        wandb_log_dict.update(output_dict)
+                    # Log RA-BC statistics if enabled
+                    if rabc_weights is not None:
+                        rabc_stats = rabc_weights.get_stats()
+                        wandb_log_dict.update(
+                            {
+                                "rabc_delta_mean": rabc_stats["delta_mean"],
+                                "rabc_delta_std": rabc_stats["delta_std"],
+                                "rabc_num_frames": rabc_stats["num_frames"],
+                            }
+                        )
+                    wandb_logger.log_dict(wandb_log_dict, step)
+                train_tracker.reset_averages()
+
+            if should_log_gripper_window:
+                gripper_window_dict = gripper_debug_window.as_reduced_dict(accelerator)
+                if is_main_process:
+                    window_start = int(gripper_window_dict["window_start_step"])
+                    window_end = int(gripper_window_dict["window_end_step"])
+                    logging.info(
+                        "gripper window %d-%d target0=%.0f target1=%.0f pred0=%.0f pred1=%.0f "
+                        "tn=%.0f tp=%.0f fp=%.0f fn=%.0f acc=%.4f class0_acc=%.4f class1_acc=%.4f",
+                        window_start,
+                        window_end,
+                        gripper_window_dict["target_zero_count"],
+                        gripper_window_dict["target_one_count"],
+                        gripper_window_dict["pred_zero_count"],
+                        gripper_window_dict["pred_one_count"],
+                        gripper_window_dict["true_negative_count"],
+                        gripper_window_dict["true_positive_count"],
+                        gripper_window_dict["false_positive_count"],
+                        gripper_window_dict["false_negative_count"],
+                        gripper_window_dict["accuracy"],
+                        gripper_window_dict["class0_accuracy"],
+                        gripper_window_dict["class1_accuracy"],
                     )
-            gripper_debug_window.reset(next_start_step=step + 1)
+                    if wandb_logger:
+                        wandb_logger.log_dict(
+                            {
+                                "gripper/window_start_step": window_start,
+                                "gripper/window_end_step": window_end,
+                                "gripper/target_zero_count": gripper_window_dict["target_zero_count"],
+                                "gripper/target_one_count": gripper_window_dict["target_one_count"],
+                                "gripper/pred_zero_count": gripper_window_dict["pred_zero_count"],
+                                "gripper/pred_one_count": gripper_window_dict["pred_one_count"],
+                                "gripper/tn": gripper_window_dict["true_negative_count"],
+                                "gripper/tp": gripper_window_dict["true_positive_count"],
+                                "gripper/fp": gripper_window_dict["false_positive_count"],
+                                "gripper/fn": gripper_window_dict["false_negative_count"],
+                                "gripper/accuracy": gripper_window_dict["accuracy"],
+                                "gripper/class0_accuracy": gripper_window_dict["class0_accuracy"],
+                                "gripper/class1_accuracy": gripper_window_dict["class1_accuracy"],
+                            },
+                            step,
+                        )
+                gripper_debug_window.reset(next_start_step=step + 1)
 
-        ##############################################################################################################
-        ##############################################################################################################
-        # SAVING CHECKPOINTS
-        ##############################################################################################################
-        ##############################################################################################################
+            ##############################################################################################################
+            ##############################################################################################################
+            # SAVING CHECKPOINTS
+            ##############################################################################################################
+            ##############################################################################################################
 
-        if cfg.save_checkpoint and is_saving_step:
-            if is_main_process:
-                logging.info(f"Checkpoint policy after step {step}")
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-                if cfg.policy.type == "xvla":
-                    _assert_xvla_finetune_contract(accelerator.unwrap_model(policy).config)
-                save_checkpoint(
-                    checkpoint_dir=checkpoint_dir,
-                    step=step,
-                    cfg=cfg,
-                    policy=accelerator.unwrap_model(policy),
-                    optimizer=optimizer,
-                    scheduler=lr_scheduler,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                )
-                update_last_checkpoint(checkpoint_dir)
-                if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
-
-            accelerator.wait_for_everyone()
-
-        ##############################################################################################################
-        ##############################################################################################################
-        # PUSH STEP FOR CUSTOM PUSH EVERY
-        ##############################################################################################################
-        ##############################################################################################################
-
-        is_push_step = cfg.push_every > 0 and step % cfg.push_every == 0 and step != cfg.steps
-        if is_push_step:
-            if is_main_process:
-                logging.info(f"Pushing checkpoint to Hub after step {step}")
-                norm_map_str = ", ".join(f"{k}={v}" for k, v in accelerator.unwrap_model(policy).config.normalization_mapping.items())
-                logging.info(colored(f"  > Saving config.json with normalization_mapping: [{norm_map_str}]", "green"))
-                original_repo_id = cfg.policy.repo_id
-                # Smart naming: append step count
-                cfg.policy.repo_id = f"{original_repo_id}-step-{step}"
-
-                unwrapped_policy = accelerator.unwrap_model(policy)
-                if cfg.policy.type == "xvla":
-                    _assert_xvla_finetune_contract(unwrapped_policy.config)
-                
-                # Push the files to the repo in a single commit by saving to a local tmp dir
-                from tempfile import TemporaryDirectory
-                from pathlib import Path
-                from huggingface_hub import HfApi
-
-                api = HfApi()
-                api.create_repo(repo_id=cfg.policy.repo_id, private=cfg.policy.private, exist_ok=True)
-                
-                with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-                    saved_path = Path(tmp) / cfg.policy.repo_id.split("/")[-1]
-                    
-                    if cfg.policy.use_peft:
-                        unwrapped_policy.save_pretrained(saved_path)
-                        unwrapped_policy.config.save_pretrained(saved_path)
-                    else:
-                        unwrapped_policy.save_pretrained(saved_path)
-
-                    cfg.save_pretrained(saved_path)
-                    if preprocessor:
-                        preprocessor.save_pretrained(saved_path)
-                    if postprocessor:
-                        postprocessor.save_pretrained(saved_path)
-                        
-                    card = unwrapped_policy.generate_model_card(
-                        cfg.dataset.repo_id, unwrapped_policy.config.type, unwrapped_policy.config.license, unwrapped_policy.config.tags
-                    )
-                    card.save(str(saved_path / "README.md"))
-
-                    api.upload_folder(repo_id=cfg.policy.repo_id, repo_type="model", folder_path=str(saved_path), commit_message=f"Upload checkpoint for step {step}", allow_patterns=["*.safetensors", "*.json", "*.yaml", "*.md"], ignore_patterns=["*.tmp", "*.log"])
-
-                # Restore original repo_id for the next steps
-                cfg.policy.repo_id = original_repo_id
-
-            accelerator.wait_for_everyone()
-
-        if cfg.env and is_eval_step:
-            if is_main_process:
-                step_id = get_step_identifier(step, cfg.steps)
-                logging.info(f"Eval policy at step {step}")
-                with torch.no_grad(), accelerator.autocast():
-                    eval_info = eval_policy_all(
-                        envs=eval_env,  # dict[suite][task_id] -> vec_env
+            if cfg.save_checkpoint and is_saving_step:
+                if is_main_process:
+                    logging.info(f"Checkpoint policy after step {step}")
+                    checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                    if cfg.policy.type == "xvla":
+                        _assert_xvla_finetune_contract(accelerator.unwrap_model(policy).config)
+                    save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
                         policy=accelerator.unwrap_model(policy),
-                        env_preprocessor=env_preprocessor,
-                        env_postprocessor=env_postprocessor,
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
-                        n_episodes=cfg.eval.n_episodes,
-                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                        max_episodes_rendered=4,
-                        start_seed=cfg.seed,
-                        max_parallel_tasks=cfg.env.max_parallel_tasks,
                     )
-                # overall metrics (suite-agnostic)
-                aggregated = eval_info["overall"]
+                    update_last_checkpoint(checkpoint_dir)
+                    if wandb_logger:
+                        wandb_logger.log_policy(checkpoint_dir)
 
-                # optional: per-suite logging
-                for suite, suite_info in eval_info.items():
-                    logging.info("Suite %s aggregated: %s", suite, suite_info)
+                accelerator.wait_for_everyone()
 
-                # meters/tracker
-                eval_metrics = {"avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),"pc_success": AverageMeter("success", ":.1f"),"eval_s": AverageMeter("eval_s", ":.3f"),}
-                eval_tracker = MetricsTracker(cfg.batch_size,dataset.num_frames,dataset.num_episodes,eval_metrics,initial_step=step,accelerator=accelerator,)
-                eval_tracker.eval_s = aggregated.pop("eval_s")
-                eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
-                eval_tracker.pc_success = aggregated.pop("pc_success")
-                if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+            ##############################################################################################################
+            ##############################################################################################################
+            # PUSH STEP FOR CUSTOM PUSH EVERY
+            ##############################################################################################################
+            ##############################################################################################################
 
-            accelerator.wait_for_everyone()
+            is_push_step = cfg.push_every > 0 and step % cfg.push_every == 0 and step != cfg.steps
+            if is_push_step:
+                if is_main_process:
+                    logging.info(f"Pushing checkpoint to Hub after step {step}")
+                    norm_map_str = ", ".join(f"{k}={v}" for k, v in accelerator.unwrap_model(policy).config.normalization_mapping.items())
+                    logging.info(colored(f"  > Saving config.json with normalization_mapping: [{norm_map_str}]", "green"))
+                    original_repo_id = cfg.policy.repo_id
+                    # Smart naming: append step count
+                    cfg.policy.repo_id = f"{original_repo_id}-step-{step}"
+
+                    unwrapped_policy = accelerator.unwrap_model(policy)
+                    if cfg.policy.type == "xvla":
+                        _assert_xvla_finetune_contract(unwrapped_policy.config)
+                    
+                    # Push the files to the repo in a single commit by saving to a local tmp dir
+                    from tempfile import TemporaryDirectory
+                    from pathlib import Path
+                    from huggingface_hub import HfApi
+
+                    api = HfApi()
+                    api.create_repo(repo_id=cfg.policy.repo_id, private=cfg.policy.private, exist_ok=True)
+                    
+                    with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                        saved_path = Path(tmp) / cfg.policy.repo_id.split("/")[-1]
+                        
+                        if cfg.policy.use_peft:
+                            unwrapped_policy.save_pretrained(saved_path)
+                            unwrapped_policy.config.save_pretrained(saved_path)
+                        else:
+                            unwrapped_policy.save_pretrained(saved_path)
+
+                        cfg.save_pretrained(saved_path)
+                        if preprocessor:
+                            preprocessor.save_pretrained(saved_path)
+                        if postprocessor:
+                            postprocessor.save_pretrained(saved_path)
+                            
+                        card = unwrapped_policy.generate_model_card(
+                            cfg.dataset.repo_id, unwrapped_policy.config.type, unwrapped_policy.config.license, unwrapped_policy.config.tags
+                        )
+                        card.save(str(saved_path / "README.md"))
+
+                        api.upload_folder(repo_id=cfg.policy.repo_id, repo_type="model", folder_path=str(saved_path), commit_message=f"Upload checkpoint for step {step}", allow_patterns=["*.safetensors", "*.json", "*.yaml", "*.md"], ignore_patterns=["*.tmp", "*.log"])
+
+                    # Restore original repo_id for the next steps
+                    cfg.policy.repo_id = original_repo_id
+
+                accelerator.wait_for_everyone()
+
+            if cfg.env and is_eval_step:
+                if is_main_process:
+                    step_id = get_step_identifier(step, cfg.steps)
+                    logging.info(f"Eval policy at step {step}")
+                    with torch.no_grad(), accelerator.autocast():
+                        eval_info = eval_policy_all(
+                            envs=eval_env,  # dict[suite][task_id] -> vec_env
+                            policy=accelerator.unwrap_model(policy),
+                            env_preprocessor=env_preprocessor,
+                            env_postprocessor=env_postprocessor,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            n_episodes=cfg.eval.n_episodes,
+                            videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                            max_episodes_rendered=4,
+                            start_seed=cfg.seed,
+                            max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        )
+                    # overall metrics (suite-agnostic)
+                    aggregated = eval_info["overall"]
+
+                    # optional: per-suite logging
+                    for suite, suite_info in eval_info.items():
+                        logging.info("Suite %s aggregated: %s", suite, suite_info)
+
+                    # meters/tracker
+                    eval_metrics = {"avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),"pc_success": AverageMeter("success", ":.1f"),"eval_s": AverageMeter("eval_s", ":.3f"),}
+                    eval_tracker = MetricsTracker(cfg.batch_size,dataset.num_frames,dataset.num_episodes,eval_metrics,initial_step=step,accelerator=accelerator,)
+                    eval_tracker.eval_s = aggregated.pop("eval_s")
+                    eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
+                    eval_tracker.pc_success = aggregated.pop("pc_success")
+                    if wandb_logger:
+                        wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                        wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
+                        wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+
+                accelerator.wait_for_everyone()
 
     if eval_env:
         close_envs(eval_env)
