@@ -1057,13 +1057,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             raw_batch = next(dl_iter)
 
             # PRE PROCESSING
-            debug_batch(raw_batch, tag="RAW (before preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
+            # debug_batch(raw_batch, tag="RAW (before preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
             # if is_main_process:
             #     # Happens only on step 0
             #     save_debug_images(batch, cfg.output_dir, step=0, prefix="raw")
     
             batch = preprocessor(raw_batch)
-            debug_batch(batch, tag="POST (after preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
+            # debug_batch(batch, tag="POST (after preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
             # if is_main_process:
             #     save_debug_images(batch, cfg.output_dir, step=0, prefix="post")
 
@@ -1073,7 +1073,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             
             slice_dim = xvla_slice_spec.real_dim if xvla_slice_spec is not None else None
 
-            debug_batch(output_dict, tag="MODEL OUTPUT dict", step=step, slice_dim=slice_dim, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
+            # debug_batch(output_dict, tag="MODEL OUTPUT dict", step=step, slice_dim=slice_dim, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
             gripper_debug_counts = output_dict.pop("gripper_debug_counts", None)
 
             ##############################################################################################################
