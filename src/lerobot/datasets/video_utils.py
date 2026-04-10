@@ -51,6 +51,15 @@ HW_ENCODERS = [
 VALID_VIDEO_CODECS = {"h264", "hevc", "libsvtav1", "auto"} | set(HW_ENCODERS)
 
 
+def _normalize_fps(fps: int | float | Fraction) -> Fraction:
+    """Convert FPS to a PyAV-friendly rational value."""
+    if isinstance(fps, Fraction):
+        return fps
+    if isinstance(fps, int):
+        return Fraction(fps, 1)
+    return Fraction(str(fps)).limit_denominator(1000)
+
+
 def _get_codec_options(
     vcodec: str,
     g: int | None = 2,
@@ -390,7 +399,7 @@ def decode_video_frames_torchcodec(
 def encode_video_frames(
     imgs_dir: Path | str,
     video_path: Path | str,
-    fps: int,
+    fps: int | float | Fraction,
     vcodec: str = "libsvtav1",
     pix_fmt: str = "yuv420p",
     g: int | None = 2,
@@ -403,6 +412,7 @@ def encode_video_frames(
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
     vcodec = resolve_vcodec(vcodec)
+    fps_fraction = _normalize_fps(fps)
 
     video_path = Path(video_path)
     imgs_dir = Path(imgs_dir)
@@ -457,7 +467,7 @@ def encode_video_frames(
 
     # Create and open output file (overwrite by default)
     with av.open(str(video_path), "w") as output:
-        output_stream = output.add_stream(vcodec, fps, options=video_options)
+        output_stream = output.add_stream(vcodec, fps_fraction, options=video_options)
         output_stream.pix_fmt = pix_fmt
         output_stream.width = width
         output_stream.height = height
@@ -649,17 +659,18 @@ class _CameraEncoderThread(threading.Thread):
                             video_options["threads"] = str(self.encoder_threads)
                     Path(self.video_path).parent.mkdir(parents=True, exist_ok=True)
                     container = av.open(str(self.video_path), "w")
-                    output_stream = container.add_stream(self.vcodec, self.fps, options=video_options)
+                    fps_fraction = _normalize_fps(self.fps)
+                    output_stream = container.add_stream(self.vcodec, fps_fraction, options=video_options)
                     output_stream.pix_fmt = self.pix_fmt
                     output_stream.width = width
                     output_stream.height = height
-                    output_stream.time_base = Fraction(1, self.fps)
+                    output_stream.time_base = Fraction(1, 1) / fps_fraction
 
                 # Encode frame with explicit timestamps
                 pil_img = Image.fromarray(frame_data)
                 video_frame = av.VideoFrame.from_image(pil_img)
                 video_frame.pts = frame_count
-                video_frame.time_base = Fraction(1, self.fps)
+                video_frame.time_base = Fraction(1, 1) / fps_fraction
                 packet = output_stream.encode(video_frame)
                 if packet:
                     container.mux(packet)

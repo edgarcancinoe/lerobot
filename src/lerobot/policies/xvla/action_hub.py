@@ -696,7 +696,10 @@ class SO101EE6DActionSpace(BaseActionSpace):
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
         """Apply sigmoid to gripper logit, map to real motor bounds, and trim to 10D EEF."""
         action = self._validate_input_dim(action, "EEF action").clone()
-        action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)]) * self.gripper_max
+        grip = torch.sigmoid(action[..., list(self.GRIP_IDX)]) * self.gripper_max
+        if getattr(self.config, "binary_gripper_inference", False):
+            grip = (grip > self.gripper_thresh).to(grip.dtype) * self.gripper_max
+        action[..., list(self.GRIP_IDX)] = grip
         return self._trim_to_real_dim(action)
 
     def compute_gripper_debug_stats(
@@ -836,7 +839,10 @@ class SO101JointActionSpace(BaseActionSpace):
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
         """Apply sigmoid to gripper logit, map to real motor bounds, and trim to 6D joints."""
         action = self._validate_input_dim(action, "Joint action").clone()
-        action[..., list(self.GRIP_IDX)] = torch.sigmoid(action[..., list(self.GRIP_IDX)]) * self.gripper_max
+        grip = torch.sigmoid(action[..., list(self.GRIP_IDX)]) * self.gripper_max
+        if getattr(self.config, "binary_gripper_inference", False):
+            grip = (grip > self.gripper_thresh).to(grip.dtype) * self.gripper_max
+        action[..., list(self.GRIP_IDX)] = grip
         return self._trim_to_real_dim(action)
 
     def compute_gripper_debug_stats(
