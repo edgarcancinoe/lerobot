@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import os
 from pprint import pformat
 
 import torch
@@ -80,47 +81,68 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
-    # Custom Augmentation Integration
+    # Dataset-side transforms are kept disabled for dataloader performance.
+    # We build an augmenter here and attach it to the dataset so training can apply it on GPU.
     image_transforms = None
     if cfg.dataset.image_transforms.enable:
-        import sys
-        from pathlib import Path
-        # Workspace root is 4 levels up: lerobot_src/src/lerobot/datasets/factory.py
-        workspace_root = Path(__file__).resolve().parents[4]
-        if str(workspace_root) not in sys.path:
-            sys.path.append(str(workspace_root))
-        
-        print("\n" + "="*80)
-        print(f"[CRITICAL DEBUG] LOADING CUSTOM AUGMENTATION PIPELINE")
-        print(f"[CRITICAL DEBUG] Workspace root: {workspace_root}")
-        print("="*80)
-        sys.stdout.flush()
-        
-        from utils.augmentations import CustomAugmentationPipeline
-        
-        # Extract parameters from config if available
-        rotation = 15
-        translation = 0.1
-        if "affine" in cfg.dataset.image_transforms.tfs:
-            affine_kwargs = cfg.dataset.image_transforms.tfs["affine"].kwargs
-            if "degrees" in affine_kwargs:
-                degs = affine_kwargs["degrees"]
-                rotation = degs[1] if isinstance(degs, (list, tuple)) else degs
-            if "translate" in affine_kwargs:
-                trans = affine_kwargs["translate"]
-                translation = trans[0] if isinstance(trans, (list, tuple)) else trans
+        backend = os.environ.get("THESIS_AUGMENTATION_BACKEND", "custom").strip().lower()
+        if backend not in {"custom", "lerobot"}:
+            logging.warning(
+                "Unknown THESIS_AUGMENTATION_BACKEND=%s; falling back to 'custom'.",
+                backend,
+            )
+            backend = "custom"
 
-        print(f"[CRITICAL DEBUG] Params: rotation={rotation}, translation={translation}, mode=reflect")
-        image_transforms = CustomAugmentationPipeline(
-            enable_geometric=True,
-            rotation_deg=rotation,
-            translation_frac=translation,
-            fill_mode="reflect",
-            enable_photometric=True,
-        )
-        print("[CRITICAL DEBUG] CUSTOM AUGMENTATION PIPELINE INITIALIZED SUCCESSFULLY")
-        print("="*80 + "\n")
-        sys.stdout.flush()
+        if backend == "lerobot":
+            image_transforms = ImageTransforms(cfg.dataset.image_transforms)
+            logging.info("Using lerobot ImageTransforms backend for GPU augmentation.")
+        else:
+            import sys
+            from pathlib import Path
+
+            workspace_root = Path(__file__).resolve().parents[4]
+            thesis_src = workspace_root / "vla_workspace" / "src"
+            if thesis_src.exists() and str(thesis_src) not in sys.path:
+                sys.path.append(str(thesis_src))
+
+            from thesis_vla.common.augmentations import CustomAugmentationPipeline
+
+            rotation = 15.0
+            translation = 0.1
+            if "affine" in cfg.dataset.image_transforms.tfs:
+                affine_kwargs = cfg.dataset.image_transforms.tfs["affine"].kwargs
+                if "degrees" in affine_kwargs:
+                    degrees = affine_kwargs["degrees"]
+                    if isinstance(degrees, (list, tuple)):
+                        rotation = max(abs(float(value)) for value in degrees)
+                    else:
+                        rotation = abs(float(degrees))
+                if "translate" in affine_kwargs:
+                    translate = affine_kwargs["translate"]
+                    if isinstance(translate, (list, tuple)):
+                        translation = max(abs(float(value)) for value in translate)
+                    else:
+                        translation = abs(float(translate))
+
+            fill_mode = os.environ.get("THESIS_AUG_FILL_MODE", "reflect").strip().lower()
+            enable_photometric = (
+                os.environ.get("THESIS_AUG_ENABLE_PHOTOMETRIC", "true").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            image_transforms = CustomAugmentationPipeline(
+                enable_geometric=True,
+                rotation_deg=rotation,
+                translation_frac=translation,
+                fill_mode=fill_mode,
+                enable_photometric=enable_photometric,
+            )
+            logging.info(
+                "Using custom augmentation backend (rotation=%s, translation=%s, fill_mode=%s, photometric=%s).",
+                rotation,
+                translation,
+                fill_mode,
+                enable_photometric,
+            )
 
     if isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
@@ -167,5 +189,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+
+    if image_transforms is not None:
+        dataset.image_augmenter = image_transforms
 
     return dataset
