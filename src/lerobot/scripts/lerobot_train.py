@@ -1185,10 +1185,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                             {
                                 "gripper/window_start_step": window_start,
                                 "gripper/window_end_step": window_end,
-                                "gripper/target_zero_count": gripper_window_dict["target_zero_count"],
-                                "gripper/target_one_count": gripper_window_dict["target_one_count"],
-                                "gripper/pred_zero_count": gripper_window_dict["pred_zero_count"],
-                                "gripper/pred_one_count": gripper_window_dict["pred_one_count"],
                                 "gripper/tn": gripper_window_dict["true_negative_count"],
                                 "gripper/tp": gripper_window_dict["true_positive_count"],
                                 "gripper/fp": gripper_window_dict["false_positive_count"],
