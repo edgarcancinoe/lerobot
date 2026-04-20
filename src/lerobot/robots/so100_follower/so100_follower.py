@@ -178,7 +178,27 @@ class SO100Follower(Robot):
 
         # Read arm position
         start = time.perf_counter()
-        obs_dict = self.bus.sync_read("Present_Position")
+        try:
+            # Retry sync reads to tolerate short serial hiccups.
+            obs_dict = self.bus.sync_read("Present_Position", num_retry=2)
+        except ConnectionError as sync_err:
+            # Fallback to sequential reads to pinpoint failing motors and avoid
+            # immediately aborting on a single dropped sync-read packet.
+            obs_dict = {}
+            failed_motors = []
+            for motor in self.bus.motors:
+                try:
+                    obs_dict[motor] = self.bus.read("Present_Position", motor, num_retry=2)
+                except ConnectionError:
+                    failed_motors.append(motor)
+
+            if failed_motors:
+                failed_ids = [self.bus.motors[motor].id for motor in failed_motors]
+                raise ConnectionError(
+                    f"{self} failed to read Present_Position on motors={failed_motors} ids={failed_ids}. "
+                    "Check follower power, USB serial adapter, cable chain continuity, and port selection."
+                ) from sync_err
+
         obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")

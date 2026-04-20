@@ -93,6 +93,9 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
         fails for any reason.
     """
     try:
+        fpath = Path(fpath)
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+
         if isinstance(image, np.ndarray):
             img = image_array_to_pil_image(image)
         elif isinstance(image, PIL.Image.Image):
