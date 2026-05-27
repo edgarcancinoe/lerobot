@@ -50,6 +50,16 @@ class WandBConfig:
 
 
 @dataclass
+class ValidationConfig:
+    enable: bool = False
+    split_ratio: float = 0.1
+    freq: int = 1_000
+    max_batches: int = 10
+    seed: int = 1337
+    metric: str = "loss"
+
+
+@dataclass
 class EvalConfig:
     n_episodes: int = 50
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.

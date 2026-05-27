@@ -488,7 +488,7 @@ class OpenCVCamera(Camera):
             self.new_frame_event.clear()
 
     @check_if_not_connected
-    def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
+    def async_read(self, timeout_ms: float = 500) -> NDArray[Any]:
         """
         Reads the latest available frame asynchronously.
 

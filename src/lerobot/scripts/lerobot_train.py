@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import warnings
 import os
+from types import SimpleNamespace
 
 from lerobot.policies import xvla
 
@@ -45,7 +46,6 @@ from tqdm.auto import tqdm
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
-from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle, dataset_to_policy_features
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
@@ -60,7 +60,7 @@ from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 import torchvision.utils as vutils
-from lerobot.utils.train_utils import get_step_checkpoint_dir, get_step_identifier, load_training_state, save_checkpoint, update_last_checkpoint
+from lerobot.utils.train_utils import get_step_checkpoint_dir, get_step_identifier, load_training_state, save_checkpoint, update_last_checkpoint, update_named_checkpoint
 from lerobot.utils.utils import format_big_number, has_method, init_logging
 from lerobot.utils.constants import OBS_IMAGES
 
@@ -576,6 +576,167 @@ class GripperDebugWindow:
         reduced["window_end_step"] = float(self.end_step)
         return reduced
 
+
+def _selected_episode_ids(dataset) -> list[int]:
+    if dataset.episodes is not None:
+        return [int(episode_id) for episode_id in dataset.episodes]
+    return list(range(dataset.meta.total_episodes))
+
+
+def split_train_validation_episodes(dataset, split_ratio: float, seed: int) -> tuple[list[int], list[int]]:
+    episode_ids = _selected_episode_ids(dataset)
+    num_episodes = len(episode_ids)
+    if num_episodes < 2:
+        raise ValueError("Validation requires at least 2 selected episodes.")
+    num_val = int(num_episodes * split_ratio)
+    if num_val <= 0 or num_val >= num_episodes:
+        raise ValueError(
+            f"validation.split_ratio={split_ratio} produced an invalid validation split for {num_episodes} episodes."
+        )
+    generator = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(num_episodes, generator=generator).tolist()
+    val_positions = set(perm[:num_val])
+    train_episodes = sorted(episode_ids[idx] for idx in range(num_episodes) if idx not in val_positions)
+    val_episodes = sorted(episode_ids[idx] for idx in val_positions)
+    return train_episodes, val_episodes
+
+
+class FixedIndexSampler:
+    def __init__(self, indices: list[int], shuffle: bool = False):
+        self.indices = indices
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        if self.shuffle:
+            for index in torch.randperm(len(self.indices)).tolist():
+                yield self.indices[index]
+            return
+        for index in self.indices:
+            yield index
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+
+def build_dataset_frame_indices(dataset, drop_n_last_frames: int = 0) -> list[int]:
+    indices = []
+    absolute_to_relative_idx = getattr(dataset, "_absolute_to_relative_idx", None)
+    for episode_id in _selected_episode_ids(dataset):
+        episode = dataset.meta.episodes[episode_id]
+        start_index = int(episode["dataset_from_index"])
+        end_index = int(episode["dataset_to_index"]) - drop_n_last_frames
+        for abs_idx in range(start_index, max(start_index, end_index)):
+            if absolute_to_relative_idx is None:
+                indices.append(abs_idx)
+                continue
+            rel_idx = absolute_to_relative_idx.get(abs_idx)
+            if rel_idx is not None:
+                indices.append(rel_idx)
+    return indices
+
+
+def make_dataset_with_episodes(cfg: TrainPipelineConfig, episodes: list[int], disable_augmentation: bool = False):
+    image_transforms_cfg = cfg.dataset.image_transforms
+    if disable_augmentation:
+        image_transforms_cfg = dataclasses.replace(image_transforms_cfg, enable=False)
+    dataset_cfg = dataclasses.replace(cfg.dataset, episodes=list(episodes), image_transforms=image_transforms_cfg)
+    dataset_cfg_ns = SimpleNamespace(
+        dataset=dataset_cfg,
+        policy=cfg.policy,
+        tolerance_s=cfg.tolerance_s,
+        num_workers=cfg.num_workers,
+    )
+    return make_dataset(dataset_cfg_ns)
+
+
+def _infer_batch_size(batch: dict[str, Any]) -> int:
+    for value in batch.values():
+        if isinstance(value, torch.Tensor) and value.ndim > 0:
+            return int(value.shape[0])
+    raise ValueError("Unable to infer batch size from validation batch.")
+
+
+def _compute_policy_loss(policy: PreTrainedPolicy, batch: Any, accelerator: Accelerator, rabc_weights_provider=None) -> tuple[torch.Tensor, dict[str, Any], int]:
+    rabc_batch_weights = None
+    rabc_batch_stats = None
+    if rabc_weights_provider is not None:
+        rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
+    with accelerator.autocast():
+        if rabc_batch_weights is not None:
+            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+            epsilon = 1e-6
+            loss = (per_sample_loss * rabc_batch_weights).sum() / (rabc_batch_weights.sum() + epsilon)
+            output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
+            output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
+            output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+            batch_size = int(per_sample_loss.shape[0]) if per_sample_loss.ndim > 0 else _infer_batch_size(batch)
+        else:
+            loss, output_dict = policy.forward(batch)
+            batch_size = _infer_batch_size(batch)
+    return loss, output_dict, batch_size
+
+
+def run_validation(policy: PreTrainedPolicy, dataloader, preprocessor, accelerator: Accelerator, max_batches: int, rabc_weights_provider=None) -> dict[str, float]:
+    was_training = policy.training
+    policy.eval()
+    local_loss_sum = 0.0
+    local_sample_count = 0.0
+    local_batch_count = 0.0
+    local_gripper_counts = {key: 0.0 for key in GRIPPER_DEBUG_COUNT_KEYS}
+    try:
+        with torch.no_grad():
+            for batch_index, raw_batch in enumerate(dataloader):
+                if batch_index >= max_batches:
+                    break
+                batch = preprocessor(raw_batch)
+                loss, output_dict, batch_size = _compute_policy_loss(
+                    policy,
+                    batch,
+                    accelerator,
+                    rabc_weights_provider=rabc_weights_provider,
+                )
+                local_loss_sum += float(loss.detach().item()) * batch_size
+                local_sample_count += batch_size
+                local_batch_count += 1
+                gripper_debug_counts = output_dict.get("gripper_debug_counts")
+                if gripper_debug_counts is not None:
+                    for key in GRIPPER_DEBUG_COUNT_KEYS:
+                        value = gripper_debug_counts[key]
+                        if isinstance(value, torch.Tensor):
+                            value = value.detach().item()
+                        local_gripper_counts[key] += float(value)
+    finally:
+        policy.train(was_training)
+
+    reduced_payload = accelerator.reduce(
+        torch.tensor(
+            [local_loss_sum, local_sample_count, local_batch_count, *[local_gripper_counts[key] for key in GRIPPER_DEBUG_COUNT_KEYS]],
+            device=accelerator.device,
+            dtype=torch.float32,
+        ),
+        reduction="sum",
+    )
+    total_loss_sum = float(reduced_payload[0].item())
+    total_sample_count = float(reduced_payload[1].item())
+    total_batch_count = int(reduced_payload[2].item())
+    if total_batch_count < 1 or total_sample_count <= 0:
+        raise RuntimeError("Validation ran with zero batches. Increase validation.max_batches or validation split size.")
+    metrics = {
+        "loss": total_loss_sum / total_sample_count,
+        "num_batches": float(total_batch_count),
+        "num_samples": total_sample_count,
+    }
+    offset = 3
+    reduced_counts = {key: float(reduced_payload[offset + idx].item()) for idx, key in enumerate(GRIPPER_DEBUG_COUNT_KEYS)}
+    total = reduced_counts["true_negative_count"] + reduced_counts["true_positive_count"] + reduced_counts["false_positive_count"] + reduced_counts["false_negative_count"]
+    if total > 0:
+        class0_total = reduced_counts["target_zero_count"]
+        class1_total = reduced_counts["target_one_count"]
+        metrics["gripper_accuracy"] = (reduced_counts["true_negative_count"] + reduced_counts["true_positive_count"]) / total
+        metrics["gripper_class0_accuracy"] = reduced_counts["true_negative_count"] / class0_total if class0_total > 0 else 0.0
+        metrics["gripper_class1_accuracy"] = reduced_counts["true_positive_count"] / class1_total if class1_total > 0 else 0.0
+    return metrics
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -612,35 +773,12 @@ def update_policy(
     start_time = time.perf_counter()
     policy.train()
 
-    # Get RA-BC weights if enabled
-    rabc_batch_weights = None
-    rabc_batch_stats = None
-    if rabc_weights_provider is not None:
-        rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
-
     grad_norm = torch.tensor(0.0, device=accelerator.device)
     did_step = False
 
     with accelerator.accumulate(policy):
-        # Let accelerator handle mixed precision
-        with accelerator.autocast():
-            # Use per-sample loss when RA-BC is enabled for proper weighting
-            if rabc_batch_weights is not None:
-                # Get per-sample losses
-                per_sample_loss, output_dict = policy.forward(batch, reduction="none")
-
-                # Apply RA-BC weights: L_RA-BC = Σ(w_i * l_i) / (Σw_i + ε)
-                # rabc_batch_weights is already normalized to sum to batch_size
-                epsilon = 1e-6
-                loss = (per_sample_loss * rabc_batch_weights).sum() / (rabc_batch_weights.sum() + epsilon)
-                # Log raw mean weight (before normalization) - this is the meaningful metric
-                output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
-                output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
-                output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
-            else:
-                loss, output_dict = policy.forward(batch)
-
-            # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+        loss, output_dict, _ = _compute_policy_loss(policy, batch, accelerator, rabc_weights_provider)
+        # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
         # Use accelerator's backward method
         accelerator.backward(loss)
@@ -746,16 +884,42 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
+    validation_enabled = cfg.validation.enable
+    val_dataset = None
+    train_episodes = None
+    val_episodes = None
+    base_dataset = None
+
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
         logging.info("Creating dataset")
-        dataset = make_dataset(cfg)
+        base_dataset = make_dataset(cfg)
+        if validation_enabled:
+            train_episodes, val_episodes = split_train_validation_episodes(
+                base_dataset,
+                cfg.validation.split_ratio,
+                cfg.validation.seed,
+            )
+            dataset = make_dataset_with_episodes(cfg, train_episodes)
+            val_dataset = make_dataset_with_episodes(cfg, val_episodes, disable_augmentation=True)
+        else:
+            dataset = base_dataset
 
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
-        dataset = make_dataset(cfg)
+        if validation_enabled:
+            base_dataset = make_dataset(cfg)
+            train_episodes, val_episodes = split_train_validation_episodes(
+                base_dataset,
+                cfg.validation.split_ratio,
+                cfg.validation.seed,
+            )
+            dataset = make_dataset_with_episodes(cfg, train_episodes)
+            val_dataset = make_dataset_with_episodes(cfg, val_episodes, disable_augmentation=True)
+        else:
+            dataset = make_dataset(cfg)
 
     ##############################################################################################################
     ##############################################################################################################
@@ -769,6 +933,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if hasattr(dataset, "meta") and xvla_slice_spec is not None:
         slice_dataset_meta_in_place(dataset.meta, xvla_slice_spec)
+    if val_dataset is not None and hasattr(val_dataset, "meta") and xvla_slice_spec is not None:
+        slice_dataset_meta_in_place(val_dataset.meta, xvla_slice_spec)
 
     if cfg.policy.type == "xvla":
         _enforce_xvla_finetune_contract(cfg.policy)
@@ -993,6 +1159,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
+    if validation_enabled and cfg.save_checkpoint and cfg.validation.metric == "loss" and cfg.validation.freq % cfg.save_freq != 0:
+        raise ValueError(
+            "validation.freq must be a multiple of save_freq so best_checkpoint always points to an existing checkpoint."
+        )
+
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         if cfg.env is not None:
@@ -1012,15 +1183,21 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         )
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
+        if validation_enabled and val_dataset is not None and train_episodes is not None and val_episodes is not None:
+            logging.info(
+                "Validation split: total_selected_episodes=%s train_episodes=%s val_episodes=%s ratio=%.3f seed=%s",
+                len(train_episodes) + len(val_episodes),
+                len(train_episodes),
+                len(val_episodes),
+                cfg.validation.split_ratio,
+                cfg.validation.seed,
+            )
 
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=cfg.policy.drop_n_last_frames,
+        sampler = FixedIndexSampler(
+            build_dataset_frame_indices(dataset, drop_n_last_frames=cfg.policy.drop_n_last_frames),
             shuffle=True,
         )
     else:
@@ -1028,10 +1205,25 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         sampler = None
     
     dataloader = torch.utils.data.DataLoader( dataset, num_workers=cfg.num_workers, batch_size=cfg.batch_size, shuffle=shuffle and not cfg.dataset.streaming, sampler=sampler, pin_memory=device.type == "cuda", drop_last=False, prefetch_factor=2 if cfg.num_workers > 0 else None,)
+    val_dataloader = None
+    if validation_enabled and val_dataset is not None:
+        if hasattr(cfg.policy, "drop_n_last_frames"):
+            val_sampler = FixedIndexSampler(
+                build_dataset_frame_indices(val_dataset, drop_n_last_frames=cfg.policy.drop_n_last_frames),
+                shuffle=False,
+            )
+            val_shuffle = False
+        else:
+            val_sampler = None
+            val_shuffle = False
+        val_dataloader = torch.utils.data.DataLoader( val_dataset, num_workers=cfg.num_workers, batch_size=cfg.batch_size, shuffle=val_shuffle and not cfg.dataset.streaming, sampler=val_sampler, pin_memory=device.type == "cuda", drop_last=False, prefetch_factor=2 if cfg.num_workers > 0 else None,)
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(policy, optimizer, dataloader, lr_scheduler)
+    if val_dataloader is not None:
+        policy, optimizer, dataloader, val_dataloader, lr_scheduler = accelerator.prepare(policy, optimizer, dataloader, val_dataloader, lr_scheduler)
+    else:
+        policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(policy, optimizer, dataloader, lr_scheduler)
     dl_iter = cycle(dataloader)
     policy.train()
     train_metrics = { "loss": AverageMeter("loss", ":.3f"), "grad_norm": AverageMeter("grdn", ":.3f"), "lr": AverageMeter("lr", ":0.1e"), "update_s": AverageMeter("updt_s", ":.3f"), "dataloading_s": AverageMeter("data_s", ":.3f"),}
@@ -1048,6 +1240,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         and getattr(accelerator.unwrap_model(policy).config, "enable_gripper_debug_stats", False)
         else None
     )
+    best_validation_loss = float("inf")
+    best_validation_step = 0
 
     ##############################################################################################################
     ##############################################################################################################
@@ -1118,6 +1312,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 (cfg.log_freq > 0 and step % cfg.log_freq == 0) or step == cfg.steps
             )
             is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+            is_validation_step = validation_enabled and val_dataloader is not None and (
+                step % cfg.validation.freq == 0 or step == cfg.steps
+            )
             is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
             if training_progress_bar is not None:
@@ -1203,6 +1400,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             ##############################################################################################################
             ##############################################################################################################
 
+            checkpoint_dir = None
             if cfg.save_checkpoint and is_saving_step:
                 if is_main_process:
                     logging.info(f"Checkpoint policy after step {step}")
@@ -1224,6 +1422,40 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         wandb_logger.log_policy(checkpoint_dir)
 
                 accelerator.wait_for_everyone()
+
+            if is_validation_step:
+                val_metrics = run_validation(
+                    policy,
+                    val_dataloader,
+                    preprocessor,
+                    accelerator,
+                    cfg.validation.max_batches,
+                    rabc_weights_provider=rabc_weights,
+                )
+                if is_main_process:
+                    log_parts = [
+                        f"Validation at step {step}",
+                        f"loss={val_metrics['loss']:.6f}",
+                        f"batches={int(val_metrics['num_batches'])}",
+                        f"samples={int(val_metrics['num_samples'])}",
+                    ]
+                    if "gripper_accuracy" in val_metrics:
+                        log_parts.append(f"gripper_acc={val_metrics['gripper_accuracy']:.4f}")
+                        log_parts.append(f"class0_acc={val_metrics['gripper_class0_accuracy']:.4f}")
+                        log_parts.append(f"class1_acc={val_metrics['gripper_class1_accuracy']:.4f}")
+                    logging.info(" ".join(log_parts))
+                    if wandb_logger:
+                        wandb_logger.log_dict(val_metrics, step, mode="val")
+                    if val_metrics["loss"] < best_validation_loss:
+                        best_validation_loss = val_metrics["loss"]
+                        best_validation_step = step
+                        if checkpoint_dir is not None:
+                            update_named_checkpoint(checkpoint_dir, "best_checkpoint")
+                            logging.info(
+                                "Updated best checkpoint -> step %s (val_loss=%.6f)",
+                                best_validation_step,
+                                best_validation_loss,
+                            )
 
             ##############################################################################################################
             ##############################################################################################################
@@ -1323,6 +1555,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("End of training")
+        if validation_enabled and best_validation_step > 0:
+            logging.info(
+                "Best validation checkpoint: step=%s val_loss=%.6f",
+                best_validation_step,
+                best_validation_loss,
+            )
 
         if cfg.policy.push_to_hub:
             unwrapped_policy = accelerator.unwrap_model(policy)

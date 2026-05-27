@@ -24,7 +24,7 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from lerobot import envs
 from lerobot.configs import parser
-from lerobot.configs.default import DatasetConfig, EvalConfig, PeftConfig, WandBConfig
+from lerobot.configs.default import DatasetConfig, EvalConfig, PeftConfig, ValidationConfig, WandBConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.optim import OptimizerConfig
 from lerobot.optim.schedulers import LRSchedulerConfig
@@ -67,6 +67,7 @@ class TrainPipelineConfig(HubMixin):
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
     peft: PeftConfig | None = None
 
@@ -140,6 +141,20 @@ class TrainPipelineConfig(HubMixin):
 
         if self.gradient_accumulation_steps < 1:
             raise ValueError("gradient_accumulation_steps must be >= 1.")
+
+        if self.validation.enable:
+            if not 0.0 < self.validation.split_ratio < 1.0:
+                raise ValueError(
+                    "validation.split_ratio must be in the open interval (0, 1)."
+                )
+            if self.validation.freq < 1:
+                raise ValueError("validation.freq must be >= 1.")
+            if self.validation.max_batches < 1:
+                raise ValueError("validation.max_batches must be >= 1.")
+            if self.validation.metric != "loss":
+                raise ValueError(
+                    f"Unsupported validation.metric={self.validation.metric!r}. Only 'loss' is supported."
+                )
 
         if self.policy.push_to_hub and not self.policy.repo_id:
             raise ValueError(

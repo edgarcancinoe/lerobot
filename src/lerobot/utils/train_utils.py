@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from pathlib import Path
+import shutil
 
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -55,11 +56,18 @@ def load_training_step(save_dir: Path) -> int:
 
 
 def update_last_checkpoint(checkpoint_dir: Path) -> Path:
-    last_checkpoint_dir = checkpoint_dir.parent / LAST_CHECKPOINT_LINK
-    if last_checkpoint_dir.is_symlink():
-        last_checkpoint_dir.unlink()
+    return update_named_checkpoint(checkpoint_dir, LAST_CHECKPOINT_LINK)
+
+
+def update_named_checkpoint(checkpoint_dir: Path, link_name: str) -> Path:
+    link_path = checkpoint_dir.parent / link_name
+    if link_path.is_symlink() or link_path.is_file():
+        link_path.unlink()
+    elif link_path.is_dir():
+        shutil.rmtree(link_path)
     relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
-    last_checkpoint_dir.symlink_to(relative_target)
+    link_path.symlink_to(relative_target)
+    return link_path
 
 
 def save_checkpoint(
