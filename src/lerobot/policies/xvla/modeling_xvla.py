@@ -45,12 +45,7 @@ class XVLAModel(nn.Module):
     XVLA backbone that stitches Florence-2 embeddings with the temporal/action transformer head.
     """
 
-    def __init__(
-        self,
-        config: XVLAConfig,
-        florence_config: Florence2Config,
-        proprio_dim: int,
-    ) -> None:
+    def __init__(self, config: XVLAConfig, florence_config: Florence2Config, proprio_dim: int) -> None:
         super().__init__()
         self.config = config
         self.chunk_size: int = config.chunk_size
@@ -59,17 +54,8 @@ class XVLAModel(nn.Module):
         # Build action space with auto-detection for "auto" mode
         if config.action_mode.lower() == "auto":
             # Auto-detect real action dim from config.action_feature
-            real_dim = (
-                config.action_feature.shape[-1]
-                if config.action_feature is not None
-                else config.max_action_dim
-            )
-            self.action_space = build_action_space(
-                config.action_mode.lower(),
-                config=config,
-                real_dim=real_dim,
-                max_dim=config.max_action_dim,
-            )
+            real_dim = (config.action_feature.shape[-1] if config.action_feature is not None else config.max_action_dim)
+            self.action_space = build_action_space(config.action_mode.lower(), config=config, real_dim=real_dim, max_dim=config.max_action_dim)
         else:
             self.action_space = build_action_space(config.action_mode.lower(), config=config)
 
