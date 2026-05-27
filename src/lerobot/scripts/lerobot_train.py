@@ -1159,11 +1159,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
-    if validation_enabled and cfg.save_checkpoint and cfg.validation.metric == "loss" and cfg.validation.freq % cfg.save_freq != 0:
-        raise ValueError(
-            "validation.freq must be a multiple of save_freq so best_checkpoint always points to an existing checkpoint."
-        )
-
     if is_main_process:
         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         if cfg.env is not None:
@@ -1449,13 +1444,31 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     if val_metrics["loss"] < best_validation_loss:
                         best_validation_loss = val_metrics["loss"]
                         best_validation_step = step
-                        if checkpoint_dir is not None:
-                            update_named_checkpoint(checkpoint_dir, "best_checkpoint")
+                        if checkpoint_dir is None:
+                            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
                             logging.info(
-                                "Updated best checkpoint -> step %s (val_loss=%.6f)",
+                                "Saving best-validation checkpoint at step %s (val_loss=%.6f)",
                                 best_validation_step,
                                 best_validation_loss,
                             )
+                            if cfg.policy.type == "xvla":
+                                _assert_xvla_finetune_contract(accelerator.unwrap_model(policy).config)
+                            save_checkpoint(
+                                checkpoint_dir=checkpoint_dir,
+                                step=step,
+                                cfg=cfg,
+                                policy=accelerator.unwrap_model(policy),
+                                optimizer=optimizer,
+                                scheduler=lr_scheduler,
+                                preprocessor=preprocessor,
+                                postprocessor=postprocessor,
+                            )
+                        update_named_checkpoint(checkpoint_dir, "best_checkpoint")
+                        logging.info(
+                            "Updated best checkpoint -> step %s (val_loss=%.6f)",
+                            best_validation_step,
+                            best_validation_loss,
+                        )
 
             ##############################################################################################################
             ##############################################################################################################
