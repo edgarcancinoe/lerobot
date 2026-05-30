@@ -682,6 +682,9 @@ def run_validation(policy: PreTrainedPolicy, dataloader, preprocessor, accelerat
     local_loss_sum = 0.0
     local_sample_count = 0.0
     local_batch_count = 0.0
+    component_metric_names = ("position_loss", "rotate6D_loss", "gripper_loss")
+    local_component_sums = {name: 0.0 for name in component_metric_names}
+    component_seen = {name: False for name in component_metric_names}
     local_gripper_counts = {key: 0.0 for key in GRIPPER_DEBUG_COUNT_KEYS}
     try:
         with torch.no_grad():
@@ -698,6 +701,14 @@ def run_validation(policy: PreTrainedPolicy, dataloader, preprocessor, accelerat
                 local_loss_sum += float(loss.detach().item()) * batch_size
                 local_sample_count += batch_size
                 local_batch_count += 1
+                for metric_name in component_metric_names:
+                    value = output_dict.get(metric_name)
+                    if value is None:
+                        continue
+                    if isinstance(value, torch.Tensor):
+                        value = value.detach().item()
+                    local_component_sums[metric_name] += float(value) * batch_size
+                    component_seen[metric_name] = True
                 gripper_debug_counts = output_dict.get("gripper_debug_counts")
                 if gripper_debug_counts is not None:
                     for key in GRIPPER_DEBUG_COUNT_KEYS:
@@ -710,7 +721,14 @@ def run_validation(policy: PreTrainedPolicy, dataloader, preprocessor, accelerat
 
     reduced_payload = accelerator.reduce(
         torch.tensor(
-            [local_loss_sum, local_sample_count, local_batch_count, *[local_gripper_counts[key] for key in GRIPPER_DEBUG_COUNT_KEYS]],
+            [
+                local_loss_sum,
+                local_sample_count,
+                local_batch_count,
+                *[local_component_sums[name] for name in component_metric_names],
+                *[1.0 if component_seen[name] else 0.0 for name in component_metric_names],
+                *[local_gripper_counts[key] for key in GRIPPER_DEBUG_COUNT_KEYS],
+            ],
             device=accelerator.device,
             dtype=torch.float32,
         ),
@@ -727,6 +745,19 @@ def run_validation(policy: PreTrainedPolicy, dataloader, preprocessor, accelerat
         "num_samples": total_sample_count,
     }
     offset = 3
+    component_sums = {
+        name: float(reduced_payload[offset + idx].item())
+        for idx, name in enumerate(component_metric_names)
+    }
+    offset += len(component_metric_names)
+    component_seen_counts = {
+        name: float(reduced_payload[offset + idx].item())
+        for idx, name in enumerate(component_metric_names)
+    }
+    offset += len(component_metric_names)
+    for name in component_metric_names:
+        if component_seen_counts[name] > 0:
+            metrics[name] = component_sums[name] / total_sample_count
     reduced_counts = {key: float(reduced_payload[offset + idx].item()) for idx, key in enumerate(GRIPPER_DEBUG_COUNT_KEYS)}
     total = reduced_counts["true_negative_count"] + reduced_counts["true_positive_count"] + reduced_counts["false_positive_count"] + reduced_counts["false_negative_count"]
     if total > 0:
@@ -1434,6 +1465,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         f"batches={int(val_metrics['num_batches'])}",
                         f"samples={int(val_metrics['num_samples'])}",
                     ]
+                    for component_name in ("position_loss", "rotate6D_loss", "gripper_loss"):
+                        if component_name in val_metrics:
+                            log_parts.append(f"{component_name}={val_metrics[component_name]:.6f}")
                     if "gripper_accuracy" in val_metrics:
                         log_parts.append(f"gripper_acc={val_metrics['gripper_accuracy']:.4f}")
                         log_parts.append(f"class0_acc={val_metrics['gripper_class0_accuracy']:.4f}")
