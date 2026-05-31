@@ -200,6 +200,8 @@ class XVLAModel(nn.Module):
         domain_id: torch.LongTensor,
         proprio: torch.Tensor,
         action: torch.Tensor,
+        t: torch.Tensor | None = None,
+        action_noise: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for the XVLA model.
@@ -211,13 +213,13 @@ class XVLAModel(nn.Module):
 
         enc = self.forward_vlm(input_ids, image_input, image_mask)
 
-        batch_size = input_ids.shape[0]
-        t = (
-            torch.rand(1, device=input_ids.device, dtype=target_dtype)
-            + torch.arange(batch_size, device=input_ids.device, dtype=target_dtype) / batch_size
-        ) % (1 - 1e-5)
-
-        action_noisy = torch.randn_like(action) * t.view(-1, 1, 1) + action * (1 - t).view(-1, 1, 1)
+        t, action_noisy = self._build_corrupted_action(
+            action=action,
+            device=input_ids.device,
+            target_dtype=target_dtype,
+            t=t,
+            action_noise=action_noise,
+        )
         # print("============================================")
         # print(f"Proprioceptive info raw: {proprio}")
         # print("============================================")
@@ -237,6 +239,39 @@ class XVLAModel(nn.Module):
         )
         loss_dict = self.action_space.compute_loss(pred_action, action)
         return loss_dict, pred_action
+
+    def _build_corrupted_action(
+        self,
+        action: torch.Tensor,
+        device: torch.device,
+        target_dtype: torch.dtype,
+        t: torch.Tensor | None = None,
+        action_noise: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = action.shape[0]
+        if t is None:
+            t = (
+                torch.rand(1, device=device, dtype=target_dtype)
+                + torch.arange(batch_size, device=device, dtype=target_dtype) / batch_size
+            ) % (1 - 1e-5)
+        else:
+            t = t.to(device=device, dtype=target_dtype)
+            if t.ndim == 0:
+                t = t.expand(batch_size)
+            elif t.ndim != 1 or t.shape[0] != batch_size:
+                raise ValueError(f"Expected t with shape ({batch_size},), got {tuple(t.shape)}")
+
+        if action_noise is None:
+            action_noise = torch.randn_like(action)
+        else:
+            action_noise = action_noise.to(device=device, dtype=target_dtype)
+            if action_noise.shape != action.shape:
+                raise ValueError(
+                    f"Expected action_noise shape {tuple(action.shape)}, got {tuple(action_noise.shape)}"
+                )
+
+        action_noisy = action_noise * t.view(-1, 1, 1) + action * (1 - t).view(-1, 1, 1)
+        return t, action_noisy
 
     @torch.no_grad()
     def generate_actions(
@@ -410,6 +445,26 @@ class XVLAPolicy(PreTrainedPolicy):
         inputs = self._build_model_inputs(batch)
         targets = self._prepare_action_targets(batch)
         losses, pred_action = self.model(action=targets, **inputs)
+        total_loss = sum(losses.values())
+
+        log_dict = {k: v.detach().item() for k, v in losses.items()}
+        log_dict["loss"] = total_loss.detach().item()
+        log_dict["pred_action"] = pred_action.detach()
+        if getattr(self.config, "enable_gripper_debug_stats", False):
+            gripper_debug_counts = self.model.action_space.compute_gripper_debug_stats(pred_action, targets)
+            if gripper_debug_counts is not None:
+                log_dict["gripper_debug_counts"] = gripper_debug_counts
+        return total_loss, log_dict
+
+    def forward_deterministic_validation(
+        self,
+        batch: dict[str, Tensor],
+        t: Tensor,
+        action_noise: Tensor,
+    ) -> tuple[Tensor, dict]:
+        inputs = self._build_model_inputs(batch)
+        targets = self._prepare_action_targets(batch)
+        losses, pred_action = self.model(action=targets, t=t, action_noise=action_noise, **inputs)
         total_loss = sum(losses.values())
 
         log_dict = {k: v.detach().item() for k, v in losses.items()}

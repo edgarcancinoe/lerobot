@@ -656,13 +656,39 @@ def _infer_batch_size(batch: dict[str, Any]) -> int:
     raise ValueError("Unable to infer batch size from validation batch.")
 
 
-def _compute_policy_loss(policy: PreTrainedPolicy, batch: Any, accelerator: Accelerator, rabc_weights_provider=None) -> tuple[torch.Tensor, dict[str, Any], int]:
+def _make_xvla_validation_corruption(policy: PreTrainedPolicy, batch: Any, batch_index: int, validation_seed: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if getattr(policy, "name", None) != "xvla" or not hasattr(policy, "_prepare_action_targets") or not hasattr(policy, "model"):
+        return None
+    targets = policy._prepare_action_targets(batch)
+    target_dtype = policy.model._get_target_dtype()
+    batch_size, seq_len, action_dim = targets.shape
+    batch_seed = int(validation_seed + batch_index * 1_000_003 + batch_size * 97 + seq_len * 193 + action_dim * 389)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(batch_seed)
+    t_base = torch.rand(1, generator=generator, dtype=torch.float32)
+    t = (t_base + torch.arange(batch_size, dtype=torch.float32) / batch_size) % (1 - 1e-5)
+    action_noise = torch.randn(tuple(targets.shape), generator=generator, dtype=torch.float32)
+    return t.to(device=targets.device, dtype=target_dtype), action_noise.to(device=targets.device, dtype=target_dtype)
+
+
+def _compute_policy_loss(
+    policy: PreTrainedPolicy,
+    batch: Any,
+    accelerator: Accelerator,
+    rabc_weights_provider=None,
+    deterministic_validation_corruption: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, dict[str, Any], int]:
     rabc_batch_weights = None
     rabc_batch_stats = None
     if rabc_weights_provider is not None:
         rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
     with accelerator.autocast():
-        if rabc_batch_weights is not None:
+        deterministic_policy = policy if hasattr(policy, "forward_deterministic_validation") else accelerator.unwrap_model(policy)
+        if deterministic_validation_corruption is not None and hasattr(deterministic_policy, "forward_deterministic_validation"):
+            t, action_noise = deterministic_validation_corruption
+            loss, output_dict = deterministic_policy.forward_deterministic_validation(batch, t=t, action_noise=action_noise)
+            batch_size = _infer_batch_size(batch)
+        elif rabc_batch_weights is not None:
             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
             epsilon = 1e-6
             loss = (per_sample_loss * rabc_batch_weights).sum() / (rabc_batch_weights.sum() + epsilon)
@@ -676,9 +702,18 @@ def _compute_policy_loss(policy: PreTrainedPolicy, batch: Any, accelerator: Acce
     return loss, output_dict, batch_size
 
 
-def run_validation(policy: PreTrainedPolicy, dataloader, preprocessor, accelerator: Accelerator, max_batches: int, rabc_weights_provider=None) -> dict[str, float]:
+def run_validation(
+    policy: PreTrainedPolicy,
+    dataloader,
+    preprocessor,
+    accelerator: Accelerator,
+    max_batches: int,
+    validation_seed: int,
+    rabc_weights_provider=None,
+) -> dict[str, float]:
     was_training = policy.training
     policy.eval()
+    base_policy = accelerator.unwrap_model(policy)
     local_loss_sum = 0.0
     local_sample_count = 0.0
     local_batch_count = 0.0
@@ -692,11 +727,18 @@ def run_validation(policy: PreTrainedPolicy, dataloader, preprocessor, accelerat
                 if batch_index >= max_batches:
                     break
                 batch = preprocessor(raw_batch)
+                deterministic_validation_corruption = _make_xvla_validation_corruption(
+                    base_policy,
+                    batch,
+                    batch_index,
+                    validation_seed,
+                )
                 loss, output_dict, batch_size = _compute_policy_loss(
                     policy,
                     batch,
                     accelerator,
                     rabc_weights_provider=rabc_weights_provider,
+                    deterministic_validation_corruption=deterministic_validation_corruption,
                 )
                 local_loss_sum += float(loss.detach().item()) * batch_size
                 local_sample_count += batch_size
@@ -1456,6 +1498,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     preprocessor,
                     accelerator,
                     cfg.validation.max_batches,
+                    cfg.validation.seed,
                     rabc_weights_provider=rabc_weights,
                 )
                 if is_main_process:
