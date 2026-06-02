@@ -18,13 +18,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import XVLAAdamWConfig
-from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig, XVLAStagedPromptWarmupSchedulerConfig
 from lerobot.utils.constants import OBS_IMAGES
 
 # Conditional import for type checking and lazy loading
@@ -34,6 +35,8 @@ if TYPE_CHECKING or _transformers_available:
     from .configuration_florence2 import Florence2Config
 else:
     Florence2Config = None
+
+logger = logging.getLogger(__name__)
 
 
 @PreTrainedConfig.register_subclass("xvla")
@@ -99,6 +102,12 @@ class XVLAConfig(PreTrainedConfig):
     num_image_views: int | None = None
     empty_cameras: int = 0
 
+    # Adaptation schedule
+    adaptation_mode: str = "joint"  # Options: "joint", "staged_prompt_warmup"
+    freeze_steps: int = 1_000
+    warmup_steps: int = 2_000
+    learning_coef: float = 1.0
+
     # Freezing options for VLM components
     # By default, VLM encoders are frozen and only policy transformer + soft prompts train
     freeze_vision_encoder: bool = False  # Freeze VLM vision encoder weights
@@ -133,6 +142,30 @@ class XVLAConfig(PreTrainedConfig):
             raise ValueError("`num_image_views` must be > 0 when specified.")
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        if self.adaptation_mode not in {"joint", "staged_prompt_warmup"}:
+            raise ValueError(f"Invalid adaptation_mode: {self.adaptation_mode}")
+        if self.freeze_steps < 0:
+            raise ValueError("`freeze_steps` must be >= 0.")
+        if self.warmup_steps < 0:
+            raise ValueError("`warmup_steps` must be >= 0.")
+        if self.learning_coef <= 0:
+            raise ValueError("`learning_coef` must be > 0.")
+        if self.adaptation_mode == "staged_prompt_warmup":
+            expected = (False, False, True, True)
+            actual = (
+                self.freeze_vision_encoder,
+                self.freeze_language_encoder,
+                self.train_policy_transformer,
+                self.train_soft_prompts,
+            )
+            if actual != expected:
+                logger.warning(
+                    "Staged XVLA adaptation overrides static freeze flags to keep all later-stage parameters trainable."
+                )
+                self.freeze_vision_encoder = False
+                self.freeze_language_encoder = False
+                self.train_policy_transformer = True
+                self.train_soft_prompts = True
         self._florence_config_obj: Florence2Config | None = None
 
     def get_florence_config(self) -> Florence2Config:
@@ -186,9 +219,20 @@ class XVLAConfig(PreTrainedConfig):
             grad_clip_norm=self.optimizer_grad_clip_norm,
             soft_prompt_lr_scale=self.optimizer_soft_prompt_lr_scale,
             soft_prompt_warmup_lr_scale=self.optimizer_soft_prompt_warmup_lr_scale,
+            adaptation_mode=self.adaptation_mode,
+            learning_coef=self.learning_coef,
         )
 
-    def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig:
+    def get_scheduler_preset(self) -> CosineDecayWithWarmupSchedulerConfig | XVLAStagedPromptWarmupSchedulerConfig:
+        if self.adaptation_mode == "staged_prompt_warmup":
+            return XVLAStagedPromptWarmupSchedulerConfig(
+                peak_lr=self.optimizer_lr,
+                decay_lr=self.scheduler_decay_lr,
+                num_warmup_steps=self.warmup_steps,
+                num_decay_steps=self.scheduler_decay_steps,
+                freeze_steps=self.freeze_steps,
+                learning_coef=self.learning_coef,
+            )
         return CosineDecayWithWarmupSchedulerConfig(
             peak_lr=self.optimizer_lr,
             decay_lr=self.scheduler_decay_lr,

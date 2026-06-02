@@ -42,6 +42,23 @@ OptimizerParams = (
 )
 
 
+def split_xvla_named_parameters(params: dict[str, torch.nn.Parameter]) -> dict[str, list[torch.nn.Parameter]]:
+    groups = {"vlm": [], "transformer_core": [], "soft_prompts": [], "action_heads": []}
+    for name, param in params.items():
+        if not param.requires_grad:
+            continue
+        lname = name.lower()
+        if ".vlm." in lname or lname.startswith("vlm") or lname.startswith("model.vlm"):
+            groups["vlm"].append(param)
+        elif "soft_prompt_hub" in lname or "soft_prompt" in lname:
+            groups["soft_prompts"].append(param)
+        elif "action_encoder" in lname or "action_decoder" in lname:
+            groups["action_heads"].append(param)
+        else:
+            groups["transformer_core"].append(param)
+    return groups
+
+
 @dataclass
 class OptimizerConfig(draccus.ChoiceRegistry, abc.ABC):
     lr: float
@@ -148,9 +165,10 @@ class XVLAAdamWConfig(OptimizerConfig):
         `lr * soft_prompt_warmup_lr_scale` and should be warmed up via the scheduler.
 
     Parameter Groups:
-        - Group 0 (vlm): VLM parameters at lr * 0.1, weight_decay * 0.1
-        - Group 1 (soft_prompts): Soft-prompt parameters at lr * soft_prompt_lr_scale
-        - Group 2 (other): All other parameters at full lr
+        - Group 0 (vlm): Florence / VLM backbone
+        - Group 1 (transformer_core): policy transformer backbone and projections
+        - Group 2 (soft_prompts): domain-conditioned soft prompts
+        - Group 3 (action_heads): action encoder / decoder heads
     """
 
     lr: float = 1e-4
@@ -161,6 +179,8 @@ class XVLAAdamWConfig(OptimizerConfig):
     # Soft-prompt specific settings
     soft_prompt_lr_scale: float = 1.0  # Scale factor for soft-prompt LR (1.0 = same as base LR)
     soft_prompt_warmup_lr_scale: float | None = None  # If set, start soft-prompts at this scale (e.g., 0.01)
+    adaptation_mode: str = "joint"
+    learning_coef: float = 1.0
 
     def build(self, params: OptimizerParams) -> torch.optim.Optimizer:
         """
@@ -171,48 +191,49 @@ class XVLAAdamWConfig(OptimizerConfig):
                 or equivalent.
 
         Returns:
-            AdamW optimizer with parameter groups for VLM, soft-prompts, and other components
+            AdamW optimizer with parameter groups for staged or joint XVLA finetuning
 
         Raises:
             AssertionError: If params is not a dict (e.g., from model.parameters())
         """
         assert isinstance(params, dict), "Custom LR optimizer requires `named_parameters()` as inputs."
-
-        vlm_group, soft_prompt_group, other_group = [], [], []
-        for name, p in params.items():
-            if not p.requires_grad:
-                continue
-            if "vlm" in name.lower():
-                vlm_group.append(p)
-            elif "soft_prompt" in name.lower():
-                soft_prompt_group.append(p)
-            else:
-                other_group.append(p)
-
-        # Determine soft-prompt LR
-        soft_prompt_lr = self.lr * self.soft_prompt_lr_scale
-        if self.soft_prompt_warmup_lr_scale is not None:
-            # Start at warmup scale, scheduler will warm up to soft_prompt_lr
-            soft_prompt_lr = self.lr * self.soft_prompt_warmup_lr_scale
+        groups = split_xvla_named_parameters(params)
+        staged_mode = self.adaptation_mode == "staged_prompt_warmup"
+        if staged_mode:
+            vlm_lr = self.lr * self.learning_coef
+            vlm_weight_decay = self.weight_decay
+            soft_prompt_lr = self.lr * self.learning_coef
+        else:
+            vlm_lr = self.lr * 0.1
+            vlm_weight_decay = self.weight_decay * 0.1
+            soft_prompt_lr = self.lr * self.soft_prompt_lr_scale
+            if self.soft_prompt_warmup_lr_scale is not None:
+                soft_prompt_lr = self.lr * self.soft_prompt_warmup_lr_scale
 
         param_groups: list[dict[str, Any]] = [
             {
-                "params": vlm_group,
-                "lr": self.lr * 0.1,
-                "weight_decay": self.weight_decay * 0.1,
+                "params": groups["vlm"],
+                "lr": vlm_lr,
+                "weight_decay": vlm_weight_decay,
                 "name": "vlm",
             },
             {
-                "params": soft_prompt_group,
+                "params": groups["transformer_core"],
+                "lr": self.lr,
+                "weight_decay": self.weight_decay,
+                "name": "transformer_core",
+            },
+            {
+                "params": groups["soft_prompts"],
                 "lr": soft_prompt_lr,
                 "weight_decay": self.weight_decay,
                 "name": "soft_prompts",
             },
             {
-                "params": other_group,
+                "params": groups["action_heads"],
                 "lr": self.lr,
                 "weight_decay": self.weight_decay,
-                "name": "other",
+                "name": "action_heads",
             },
         ]
 

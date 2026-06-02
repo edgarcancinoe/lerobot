@@ -132,6 +132,59 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
         return LambdaLR(optimizer, lr_lambda, -1)
 
 
+@LRSchedulerConfig.register_subclass("xvla_staged_prompt_warmup")
+@dataclass
+class XVLAStagedPromptWarmupSchedulerConfig(LRSchedulerConfig):
+    num_warmup_steps: int
+    num_decay_steps: int
+    peak_lr: float
+    decay_lr: float
+    freeze_steps: int
+    learning_coef: float = 1.0
+
+    def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
+        actual_freeze_steps = self.freeze_steps
+        actual_warmup_steps = self.num_warmup_steps
+        actual_decay_steps = self.num_decay_steps
+        if num_training_steps < self.num_decay_steps:
+            scale_factor = num_training_steps / self.num_decay_steps
+            actual_freeze_steps = int(self.freeze_steps * scale_factor)
+            actual_warmup_steps = int(self.num_warmup_steps * scale_factor)
+            actual_decay_steps = num_training_steps
+            logging.info(
+                "Auto-scaling staged XVLA scheduler: freeze %s → %s, warmup %s → %s, decay %s → %s (scale %.3f)",
+                self.freeze_steps,
+                actual_freeze_steps,
+                self.num_warmup_steps,
+                actual_warmup_steps,
+                self.num_decay_steps,
+                actual_decay_steps,
+                scale_factor,
+            )
+
+        min_lr_ratio = self.decay_lr / self.peak_lr
+
+        def post_freeze_schedule(current_step: int) -> float:
+            if current_step < actual_freeze_steps:
+                return 0.0
+            progress = current_step - actual_freeze_steps
+            if progress < actual_warmup_steps:
+                return progress / max(1, actual_warmup_steps)
+            remain = max(1, actual_decay_steps - (actual_freeze_steps + actual_warmup_steps))
+            ratio = 0.5 * (1 + math.cos(math.pi * min(1.0, (progress - actual_warmup_steps) / remain)))
+            return min_lr_ratio + (1 - min_lr_ratio) * ratio
+
+        def make_group_lambda(group_name: str):
+            if group_name in {"vlm", "transformer_core"}:
+                return lambda current_step: 0.0 if current_step < actual_freeze_steps else post_freeze_schedule(current_step)
+            if group_name in {"soft_prompts", "action_heads"}:
+                return lambda current_step: 1.0 if current_step < actual_freeze_steps else post_freeze_schedule(current_step)
+            return lambda current_step: post_freeze_schedule(current_step)
+
+        lr_lambdas = [make_group_lambda(group.get("name", f"group_{idx}")) for idx, group in enumerate(optimizer.param_groups)]
+        return LambdaLR(optimizer, lr_lambdas, -1)
+
+
 def save_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> None:
     state_dict = scheduler.state_dict()
     write_json(state_dict, save_dir / SCHEDULER_STATE)

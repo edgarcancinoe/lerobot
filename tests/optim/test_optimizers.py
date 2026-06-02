@@ -19,8 +19,10 @@ from lerobot.optim.optimizers import (
     AdamWConfig,
     MultiAdamConfig,
     SGDConfig,
+    XVLAAdamWConfig,
     load_optimizer_state,
     save_optimizer_state,
+    split_xvla_named_parameters,
 )
 from lerobot.utils.constants import (
     OPTIMIZER_PARAM_GROUPS,
@@ -240,3 +242,43 @@ def test_save_and_load_empty_multi_optimizer_state(base_params_dict, tmp_path):
         torch.testing.assert_close(
             optimizer.state_dict()["param_groups"], loaded_optimizers[name].state_dict()["param_groups"]
         )
+
+
+def test_split_xvla_named_parameters():
+    params = {
+        "model.vlm.language_model.weight": torch.nn.Parameter(torch.randn(2, 2)),
+        "model.transformer.blocks.0.attn.qkv.weight": torch.nn.Parameter(torch.randn(2, 2)),
+        "model.transformer.soft_prompt_hub.weight": torch.nn.Parameter(torch.randn(2, 2)),
+        "model.transformer.action_encoder.fc.weight": torch.nn.Parameter(torch.randn(2, 2)),
+        "model.transformer.action_decoder.fc.weight": torch.nn.Parameter(torch.randn(2, 2)),
+        "model.transformer.blocks.1.mlp.fc1.weight": torch.nn.Parameter(torch.randn(2, 2), requires_grad=False),
+    }
+    groups = split_xvla_named_parameters(params)
+    assert len(groups["vlm"]) == 1
+    assert len(groups["transformer_core"]) == 1
+    assert len(groups["soft_prompts"]) == 1
+    assert len(groups["action_heads"]) == 2
+
+
+def test_xvla_optimizer_build_joint_and_staged():
+    params = {
+        "model.vlm.language_model.weight": torch.nn.Parameter(torch.randn(2, 2)),
+        "model.transformer.blocks.0.attn.qkv.weight": torch.nn.Parameter(torch.randn(2, 2)),
+        "model.transformer.soft_prompt_hub.weight": torch.nn.Parameter(torch.randn(2, 2)),
+        "model.transformer.action_encoder.fc.weight": torch.nn.Parameter(torch.randn(2, 2)),
+        "model.transformer.action_decoder.fc.weight": torch.nn.Parameter(torch.randn(2, 2)),
+    }
+    joint = XVLAAdamWConfig(lr=1e-4, weight_decay=1e-2).build(params)
+    staged = XVLAAdamWConfig(lr=1e-4, weight_decay=1e-2, adaptation_mode="staged_prompt_warmup", learning_coef=0.5).build(params)
+    joint_groups = {group["name"]: group for group in joint.param_groups}
+    staged_groups = {group["name"]: group for group in staged.param_groups}
+    assert set(joint_groups) == {"vlm", "transformer_core", "soft_prompts", "action_heads"}
+    assert joint_groups["vlm"]["lr"] == pytest.approx(1e-5)
+    assert joint_groups["vlm"]["weight_decay"] == pytest.approx(1e-3)
+    assert joint_groups["transformer_core"]["lr"] == pytest.approx(1e-4)
+    assert joint_groups["soft_prompts"]["lr"] == pytest.approx(1e-4)
+    assert joint_groups["action_heads"]["lr"] == pytest.approx(1e-4)
+    assert staged_groups["vlm"]["lr"] == pytest.approx(5e-5)
+    assert staged_groups["soft_prompts"]["lr"] == pytest.approx(5e-5)
+    assert staged_groups["transformer_core"]["lr"] == pytest.approx(1e-4)
+    assert staged_groups["action_heads"]["lr"] == pytest.approx(1e-4)

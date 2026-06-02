@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
+import pytest
 from packaging.version import Version
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -19,6 +20,7 @@ from lerobot.optim.schedulers import (
     CosineDecayWithWarmupSchedulerConfig,
     DiffuserSchedulerConfig,
     VQBeTSchedulerConfig,
+    XVLAStagedPromptWarmupSchedulerConfig,
     load_scheduler_state,
     save_scheduler_state,
 )
@@ -103,3 +105,40 @@ def test_save_load_scheduler_state(scheduler, tmp_path):
     loaded_scheduler = load_scheduler_state(scheduler, tmp_path)
 
     assert scheduler.state_dict() == loaded_scheduler.state_dict()
+
+
+def test_xvla_staged_prompt_warmup_scheduler():
+    params = [torch.nn.Parameter(torch.randn(2, 2)) for _ in range(4)]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [params[0]], "lr": 5e-5, "name": "vlm"},
+            {"params": [params[1]], "lr": 1e-4, "name": "transformer_core"},
+            {"params": [params[2]], "lr": 5e-5, "name": "soft_prompts"},
+            {"params": [params[3]], "lr": 1e-4, "name": "action_heads"},
+        ]
+    )
+    scheduler = XVLAStagedPromptWarmupSchedulerConfig(
+        freeze_steps=2,
+        num_warmup_steps=2,
+        num_decay_steps=10,
+        peak_lr=1e-4,
+        decay_lr=1e-5,
+        learning_coef=0.5,
+    ).build(optimizer, num_training_steps=10)
+    assert isinstance(scheduler, LambdaLR)
+    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx([0.0, 0.0, 5e-5, 1e-4])
+    for expected in (
+        [0.0, 0.0, 5e-5, 1e-4],
+        [0.0, 0.0, 0.0, 0.0],
+        [2.5e-5, 5e-5, 2.5e-5, 5e-5],
+    ):
+        optimizer.step()
+        scheduler.step()
+        assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(expected)
+    for _ in range(7):
+        optimizer.step()
+        scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(5e-6)
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(1e-5)
+    assert optimizer.param_groups[2]["lr"] == pytest.approx(5e-6)
+    assert optimizer.param_groups[3]["lr"] == pytest.approx(1e-5)
