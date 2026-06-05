@@ -536,6 +536,42 @@ GRIPPER_DEBUG_COUNT_KEYS = (
 )
 
 
+def _to_scalar_float(value: Any) -> float | None:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        value = value.detach().item()
+    elif not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _update_window_output_meters(
+    meters: dict[str, AverageMeter],
+    output_dict: dict[str, Any],
+    batch_size: int,
+    exclude_keys: set[str] | None = None,
+) -> None:
+    for key, value in output_dict.items():
+        if exclude_keys is not None and key in exclude_keys:
+            continue
+        scalar_value = _to_scalar_float(value)
+        if scalar_value is None:
+            continue
+        if key not in meters:
+            meters[key] = AverageMeter(key, ":.6f")
+        meters[key].update(scalar_value, n=batch_size)
+
+
+def _window_output_meter_dict(meters: dict[str, AverageMeter]) -> dict[str, float]:
+    return {key: meter.avg for key, meter in meters.items() if meter.count > 0}
+
+
+def _reset_window_output_meters(meters: dict[str, AverageMeter]) -> None:
+    for meter in meters.values():
+        meter.reset()
+
+
 @dataclasses.dataclass
 class GripperDebugWindow:
     start_step: int
@@ -849,6 +885,11 @@ def update_policy(
     grad_norm = torch.tensor(0.0, device=accelerator.device)
     did_step = False
 
+    if hasattr(policy, "image_augmenter") and policy.image_augmenter is not None:
+        image_keys = [k for k in batch.keys() if "image" in k]
+        for key in image_keys:
+            batch[key] = policy.image_augmenter(batch[key])
+
     with accelerator.accumulate(policy):
         loss, output_dict, _ = _compute_policy_loss(policy, batch, accelerator, rabc_weights_provider)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
@@ -880,12 +921,6 @@ def update_policy(
             if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
                 accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
             did_step = True
-
-    # Batched Augmentation on GPU
-    if hasattr(policy, "image_augmenter") and policy.image_augmenter is not None:
-        image_keys = [k for k in batch.keys() if "image" in k]
-        for key in image_keys:
-            batch[key] = policy.image_augmenter(batch[key])
 
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
@@ -1295,6 +1330,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     dl_iter = cycle(dataloader)
     policy.train()
     train_metrics = { "loss": AverageMeter("loss", ":.3f"), "grad_norm": AverageMeter("grdn", ":.3f"), "lr": AverageMeter("lr", ":0.1e"), "update_s": AverageMeter("updt_s", ":.3f"), "dataloading_s": AverageMeter("data_s", ":.3f"),}
+    train_window_output_meters: dict[str, AverageMeter] = {}
     # Use effective batch size for proper epoch calculation in distributed training
     effective_batch_size = cfg.batch_size * accelerator.num_processes * cfg.gradient_accumulation_steps
     train_tracker = MetricsTracker( effective_batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step, accelerator=accelerator,)
@@ -1341,6 +1377,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             #     save_debug_images(batch, cfg.output_dir, step=0, prefix="raw")
     
             batch = preprocessor(raw_batch)
+            batch_size = _infer_batch_size(batch)
             # debug_batch(batch, tag="POST (after preprocess)", step=step, dataset_meta=dataset.meta if hasattr(dataset, "meta") else None)
             # if is_main_process:
             #     save_debug_images(batch, cfg.output_dir, step=0, prefix="post")
@@ -1356,6 +1393,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 accelerator=accelerator,
                 lr_scheduler=lr_scheduler,
                 rabc_weights_provider=rabc_weights,
+            )
+            _update_window_output_meters(
+                train_window_output_meters,
+                output_dict,
+                batch_size,
+                exclude_keys={"pred_action", "gripper_debug_counts"},
             )
             if not did_step:
                 continue
@@ -1406,10 +1449,17 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
             if is_log_step:
                 logging.info(train_tracker)
+                train_window_metrics = _window_output_meter_dict(train_window_output_meters)
+                if train_window_metrics:
+                    preferred_order = ("loss", "position_loss", "rotate6D_loss", "gripper_loss", "joints_loss")
+                    ordered_keys = [key for key in preferred_order if key in train_window_metrics]
+                    ordered_keys += [key for key in sorted(train_window_metrics) if key not in ordered_keys]
+                    logging.info(
+                        "train window " + " ".join(f"{key}={train_window_metrics[key]:.6f}" for key in ordered_keys)
+                    )
                 if wandb_logger:
                     wandb_log_dict = train_tracker.to_dict()
-                    if output_dict:
-                        wandb_log_dict.update(output_dict)
+                    wandb_log_dict.update(train_window_metrics)
                     # Log RA-BC statistics if enabled
                     if rabc_weights is not None:
                         rabc_stats = rabc_weights.get_stats()
@@ -1422,6 +1472,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         )
                     wandb_logger.log_dict(wandb_log_dict, step)
                 train_tracker.reset_averages()
+                _reset_window_output_meters(train_window_output_meters)
 
             if should_log_gripper_window:
                 gripper_window_dict = gripper_debug_window.as_reduced_dict(accelerator)

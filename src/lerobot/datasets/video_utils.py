@@ -1041,15 +1041,14 @@ def get_video_duration_in_s(video_path: Path | str) -> float:
         Duration of the video in seconds.
     """
     with av.open(str(video_path)) as container:
-        # Get the first video stream
         video_stream = container.streams.video[0]
-        # Calculate duration: stream.duration * stream.time_base gives duration in seconds
+        if video_stream.average_rate is not None and video_stream.frames:
+            return float(video_stream.frames / float(video_stream.average_rate))
         if video_stream.duration is not None:
-            duration = float(video_stream.duration * video_stream.time_base)
-        else:
-            # Fallback to container duration if stream duration is not available
-            duration = float(container.duration / av.time_base)
-    return duration
+            return float(video_stream.duration * video_stream.time_base)
+        if container.duration is not None:
+            return float(container.duration / av.time_base)
+    raise RuntimeError(f"Could not determine video duration for {video_path}")
 
 
 class VideoEncodingManager:
