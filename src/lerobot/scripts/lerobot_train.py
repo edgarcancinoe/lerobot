@@ -131,6 +131,7 @@ def _enforce_xvla_finetune_contract(policy_cfg) -> None:
 def _rebuild_xvla_visual_input_features(policy_cfg, dataset_meta, rename_map: dict[str, str] | None) -> None:
     dataset_policy_features = dataset_to_policy_features(dataset_meta.features)
     renamed_visual_features: dict[str, PolicyFeature] = {}
+    slice_spec = get_so101_slice_spec(getattr(policy_cfg, "action_mode", None))
     for key, feature in dataset_policy_features.items():
         if feature.type is not FeatureType.VISUAL:
             continue
@@ -150,6 +151,8 @@ def _rebuild_xvla_visual_input_features(policy_cfg, dataset_meta, rename_map: di
         for key, feature in policy_cfg.input_features.items()
         if feature.type is not FeatureType.VISUAL
     }
+    if slice_spec is not None and "observation.state" in non_visual_features:
+        non_visual_features["observation.state"] = PolicyFeature(type=non_visual_features["observation.state"].type, shape=(slice_spec.real_dim,))
 
     rebuilt_input_features: dict[str, PolicyFeature] = dict(non_visual_features)
     rebuilt_input_features.update(renamed_visual_features)
@@ -167,7 +170,11 @@ def _rebuild_xvla_visual_input_features(policy_cfg, dataset_meta, rename_map: di
             shape=empty_shape,
         )
 
-    policy_cfg.input_features = rebuilt_input_features
+    policy_cfg.input_features.clear()
+    policy_cfg.input_features.update(rebuilt_input_features)
+    if slice_spec is not None and "action" in policy_cfg.output_features:
+        action_feature = policy_cfg.output_features["action"]
+        policy_cfg.output_features["action"] = PolicyFeature(type=action_feature.type, shape=(slice_spec.real_dim,))
 
 
 def _assert_xvla_finetune_contract(policy_cfg) -> None:

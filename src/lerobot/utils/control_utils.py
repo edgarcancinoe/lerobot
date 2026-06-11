@@ -18,6 +18,7 @@
 
 
 import logging
+import os
 import traceback
 from contextlib import nullcontext
 from copy import copy
@@ -102,9 +103,18 @@ def predict_action(
         torch.inference_mode(),
         torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
     ):
+        if os.environ.get("XVLA_DEBUG_OBS_STATE") == "1" and "observation.state" in observation:
+            raw_state = np.asarray(observation["observation.state"], dtype=np.float32).reshape(-1)
+            print(f"[obs-debug] raw observation.state before prepare: shape={raw_state.shape} values={raw_state.tolist()}")
         # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
         observation = prepare_observation_for_inference(observation, device, task, robot_type)
+        if os.environ.get("XVLA_DEBUG_OBS_STATE") == "1" and "observation.state" in observation:
+            prepared_state = observation["observation.state"].detach().float().cpu().reshape(-1)
+            print(f"[obs-debug] observation.state after prepare: shape={tuple(prepared_state.shape)} values={prepared_state.tolist()}")
         observation = preprocessor(observation)
+        if os.environ.get("XVLA_DEBUG_OBS_STATE") == "1" and "observation.state" in observation:
+            norm_state = observation["observation.state"].detach().float().cpu().reshape(-1)
+            print(f"[obs-debug] observation.state after preprocessor: shape={tuple(norm_state.shape)} values={norm_state.tolist()}")
 
         # Compute the next action with the policy
         # based on the current observation
