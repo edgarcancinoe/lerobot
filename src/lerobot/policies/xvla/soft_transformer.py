@@ -75,7 +75,7 @@ class Mlp(nn.Module):
         self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1])
         self.drop2 = nn.Dropout(drop_probs[1])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_keep_mask: torch.Tensor | None = None) -> torch.Tensor:
         # Expect [B, T, C] for Linear variant; caller is responsible for shapes.
         x = self.fc1(x)
         x = self.act(x)
@@ -123,7 +123,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_keep_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -144,7 +144,7 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)  # each: [batch_size, num_heads, seq_len, head_dim]
         q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.fused_attn:
+        if self.fused_attn and token_keep_mask is None:
             x = functional.scaled_dot_product_attention(
                 q,
                 k,
@@ -154,6 +154,9 @@ class Attention(nn.Module):
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)  # [batch_size, num_heads, seq_len, seq_len]
+            if token_keep_mask is not None:
+                key_mask = token_keep_mask.to(device=x.device, dtype=torch.bool).view(batch_size, 1, 1, seq_len)
+                attn = attn.masked_fill(~key_mask, torch.finfo(attn.dtype).min)
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v  # [batch_size, num_heads, seq_len, head_dim]
@@ -271,7 +274,7 @@ class TransformerBlock(nn.Module):
             drop=0.1,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_keep_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -281,7 +284,7 @@ class TransformerBlock(nn.Module):
         -------
         Tensor, [B, T, H]
         """
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), token_keep_mask=token_keep_mask)
         x = x + self.mlp(self.norm2(x))
         return x
 
