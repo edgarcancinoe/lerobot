@@ -80,11 +80,7 @@ class VQBeTSchedulerConfig(LRSchedulerConfig):
 @LRSchedulerConfig.register_subclass("cosine_decay_with_warmup")
 @dataclass
 class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
-    """Used by Physical Intelligence to train Pi0.
-
-    Automatically scales warmup and decay steps if num_training_steps < num_decay_steps.
-    This ensures the learning rate schedule completes properly even with shorter training runs.
-    """
+    """Used by Physical Intelligence to train Pi0."""
 
     num_warmup_steps: int
     num_decay_steps: int
@@ -92,23 +88,8 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
     decay_lr: float
 
     def build(self, optimizer: Optimizer, num_training_steps: int) -> LambdaLR:
-        # Auto-scale scheduler parameters if training steps are shorter than configured decay steps
         actual_warmup_steps = self.num_warmup_steps
         actual_decay_steps = self.num_decay_steps
-
-        if num_training_steps < self.num_decay_steps:
-            # Calculate scaling factor to fit the schedule into the available training steps
-            scale_factor = num_training_steps / self.num_decay_steps
-            actual_warmup_steps = int(self.num_warmup_steps * scale_factor)
-            actual_decay_steps = num_training_steps
-
-            logging.info(
-                f"Auto-scaling LR scheduler: "
-                f"num_training_steps ({num_training_steps}) < num_decay_steps ({self.num_decay_steps}). "
-                f"Scaling warmup: {self.num_warmup_steps} → {actual_warmup_steps}, "
-                f"decay: {self.num_decay_steps} → {actual_decay_steps} "
-                f"(scale factor: {scale_factor:.3f})"
-            )
 
         def lr_lambda(current_step):
             def linear_warmup_schedule(current_step):
@@ -146,21 +127,6 @@ class XVLAStagedPromptWarmupSchedulerConfig(LRSchedulerConfig):
         actual_freeze_steps = self.freeze_steps
         actual_warmup_steps = self.num_warmup_steps
         actual_decay_steps = self.num_decay_steps
-        if num_training_steps < self.num_decay_steps:
-            scale_factor = num_training_steps / self.num_decay_steps
-            actual_freeze_steps = int(self.freeze_steps * scale_factor)
-            actual_warmup_steps = int(self.num_warmup_steps * scale_factor)
-            actual_decay_steps = num_training_steps
-            logging.info(
-                "Auto-scaling staged XVLA scheduler: freeze %s → %s, warmup %s → %s, decay %s → %s (scale %.3f)",
-                self.freeze_steps,
-                actual_freeze_steps,
-                self.num_warmup_steps,
-                actual_warmup_steps,
-                self.num_decay_steps,
-                actual_decay_steps,
-                scale_factor,
-            )
 
         min_lr_ratio = self.decay_lr / self.peak_lr
 

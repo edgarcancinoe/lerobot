@@ -126,7 +126,7 @@ class XVLAConfig(PreTrainedConfig):
     optimizer_soft_prompt_warmup_lr_scale: float | None = None  # Start scale for warmup (e.g., 0.01)
 
     scheduler_warmup_steps: int = 1_000
-    scheduler_decay_steps: int = 30_000
+    scheduler_decay_steps: int = 30_000  # Fixed decay horizon used as-is by staged XVLA scheduling.
     scheduler_decay_lr: float = 2.5e-6
 
     def __post_init__(self) -> None:
